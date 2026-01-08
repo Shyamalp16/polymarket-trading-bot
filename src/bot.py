@@ -32,7 +32,7 @@ Example:
 import os
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable, TypeVar
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -49,6 +49,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
 
 class OrderSide(str, Enum):
     """Order side constants."""
@@ -264,6 +265,10 @@ class TradingBot:
             )
             logger.info("Relayer client initialized (gasless enabled)")
 
+    async def _run_in_thread(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        """Run a blocking call in a worker thread to avoid event loop stalls."""
+        return await asyncio.to_thread(func, *args, **kwargs)
+
     def is_initialized(self) -> bool:
         """Check if bot is properly initialized."""
         return (
@@ -320,7 +325,11 @@ class TradingBot:
             signed = signer.sign_order(order)
 
             # Submit to CLOB
-            response = self.clob_client.post_order(signed, order_type)
+            response = await self._run_in_thread(
+                self.clob_client.post_order,
+                signed,
+                order_type,
+            )
 
             logger.info(
                 f"Order placed: {side} {size}@{price} "
@@ -382,7 +391,7 @@ class TradingBot:
             OrderResult with cancellation status
         """
         try:
-            response = self.clob_client.cancel_order(order_id)
+            response = await self._run_in_thread(self.clob_client.cancel_order, order_id)
             logger.info(f"Order cancelled: {order_id}")
             return OrderResult(
                 success=True,
@@ -406,7 +415,7 @@ class TradingBot:
             OrderResult with cancellation status
         """
         try:
-            response = self.clob_client.cancel_all_orders()
+            response = await self._run_in_thread(self.clob_client.cancel_all_orders)
             logger.info("All orders cancelled")
             return OrderResult(
                 success=True,
@@ -433,7 +442,11 @@ class TradingBot:
             OrderResult with cancellation status
         """
         try:
-            response = self.clob_client.cancel_market_orders(market, asset_id)
+            response = await self._run_in_thread(
+                self.clob_client.cancel_market_orders,
+                market,
+                asset_id,
+            )
             logger.info(f"Market orders cancelled (market: {market or 'all'}, asset: {asset_id or 'all'})")
             return OrderResult(
                 success=True,
@@ -452,7 +465,7 @@ class TradingBot:
             List of open orders
         """
         try:
-            orders = self.clob_client.get_open_orders()
+            orders = await self._run_in_thread(self.clob_client.get_open_orders)
             logger.debug(f"Retrieved {len(orders)} open orders")
             return orders
         except Exception as e:
@@ -470,7 +483,7 @@ class TradingBot:
             Order details or None
         """
         try:
-            return self.clob_client.get_order(order_id)
+            return await self._run_in_thread(self.clob_client.get_order, order_id)
         except Exception as e:
             logger.error(f"Failed to get order {order_id}: {e}")
             return None
@@ -491,7 +504,7 @@ class TradingBot:
             List of trades
         """
         try:
-            trades = self.clob_client.get_trades(token_id, limit)
+            trades = await self._run_in_thread(self.clob_client.get_trades, token_id, limit)
             logger.debug(f"Retrieved {len(trades)} trades")
             return trades
         except Exception as e:
@@ -509,7 +522,7 @@ class TradingBot:
             Order book data
         """
         try:
-            return self.clob_client.get_order_book(token_id)
+            return await self._run_in_thread(self.clob_client.get_order_book, token_id)
         except Exception as e:
             logger.error(f"Failed to get order book: {e}")
             return {}
@@ -525,7 +538,7 @@ class TradingBot:
             Price data
         """
         try:
-            return self.clob_client.get_market_price(token_id)
+            return await self._run_in_thread(self.clob_client.get_market_price, token_id)
         except Exception as e:
             logger.error(f"Failed to get market price: {e}")
             return {}
@@ -542,7 +555,10 @@ class TradingBot:
             return False
 
         try:
-            response = self.relayer_client.deploy_safe(self.config.safe_address)
+            response = await self._run_in_thread(
+                self.relayer_client.deploy_safe,
+                self.config.safe_address,
+            )
             logger.info(f"Safe deployment initiated: {response}")
             return True
         except Exception as e:

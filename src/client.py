@@ -464,13 +464,16 @@ class ClobClient(ApiClient):
             List of trades
         """
         endpoint = "/data/trades"
-
         headers = self._build_headers("GET", endpoint)
+        params: Dict[str, Any] = {"limit": limit}
+        if token_id:
+            params["token_id"] = token_id
 
         result = self._request(
             "GET",
             endpoint,
-            headers=headers
+            headers=headers,
+            params=params
         )
 
         # Handle paginated response

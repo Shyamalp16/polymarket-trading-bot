@@ -26,7 +26,7 @@ from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from eth_account import Account
 from eth_account.messages import encode_typed_data
-from web3 import Web3
+from eth_utils import to_checksum_address
 
 
 # USDC has 6 decimal places
@@ -230,7 +230,7 @@ class OrderSigner:
             # Build order message for EIP-712
             order_message = {
                 "salt": 0,
-                "maker": Web3.to_checksum_address(order.maker),
+                "maker": to_checksum_address(order.maker),
                 "signer": self.address,
                 "taker": "0x0000000000000000000000000000000000000000",
                 "tokenId": int(order.token_id),

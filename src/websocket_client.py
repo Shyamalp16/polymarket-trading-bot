@@ -21,15 +21,11 @@ Example:
 import json
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List, Callable, Set, Union, Awaitable
+from typing import Optional, Dict, Any, List, Callable, Set, Union, Awaitable, TYPE_CHECKING
 from dataclasses import dataclass, field
 
-try:
-    import websockets
+if TYPE_CHECKING:
     from websockets.client import WebSocketClientProtocol
-except ImportError:
-    websockets = None  # type: ignore
-    WebSocketClientProtocol = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +33,20 @@ logger = logging.getLogger(__name__)
 # WebSocket endpoints
 WSS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 WSS_USER_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+
+
+def _load_websockets():
+    """Resolve WebSocket client functions without importing legacy APIs."""
+    try:
+        from websockets.asyncio.client import connect as ws_connect
+        from websockets.exceptions import ConnectionClosed
+        return ws_connect, ConnectionClosed
+    except ImportError:
+        try:
+            import websockets
+            return websockets.connect, websockets.exceptions.ConnectionClosed
+        except ImportError:
+            return None, Exception
 
 
 @dataclass
@@ -200,8 +210,10 @@ class MarketWebSocket:
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
 
+        self._ws_connect, self._connection_closed = _load_websockets()
+
         # Connection state
-        self._ws: Optional[WebSocketClientProtocol] = None
+        self._ws: Optional["WebSocketClientProtocol"] = None
         self._running = False
         self._subscribed_assets: Set[str] = set()
 
@@ -286,7 +298,10 @@ class MarketWebSocket:
             True if connected successfully
         """
         try:
-            self._ws = await websockets.connect(
+            if self._ws_connect is None:
+                raise RuntimeError("websockets is not installed")
+
+            self._ws = await self._ws_connect(
                 self.url,
                 ping_interval=self.ping_interval,
                 ping_timeout=self.ping_timeout,
@@ -486,7 +501,7 @@ class MarketWebSocket:
 
             except asyncio.TimeoutError:
                 logger.warning("WebSocket receive timeout")
-            except websockets.exceptions.ConnectionClosed as e:
+            except self._connection_closed as e:
                 logger.warning(f"WebSocket connection closed: {e}")
                 break
             except json.JSONDecodeError as e:
