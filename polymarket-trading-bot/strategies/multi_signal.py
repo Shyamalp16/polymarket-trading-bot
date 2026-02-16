@@ -1414,12 +1414,18 @@ class MultiSignalStrategy(BaseStrategy):
         position,
         current_price: float,
         exit_reason: Optional[str] = None,
+        sl_anchor_price: Optional[float] = None,
     ) -> bool:
         """
         Extend base sell to track re-entry budget state.
         """
         pnl = position.get_pnl(current_price)
-        success = await super().execute_sell(position, current_price, exit_reason=exit_reason)
+        success = await super().execute_sell(
+            position,
+            current_price,
+            exit_reason=exit_reason,
+            sl_anchor_price=sl_anchor_price,
+        )
         if success:
             slug = self._current_slug()
             if slug:

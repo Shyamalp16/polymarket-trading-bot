@@ -277,15 +277,33 @@ class BaseStrategy(ABC):
         @self.market.on_market_change
         def handle_market_change(old_slug: str, new_slug: str):  # pyright: ignore[reportUnusedFunction]
             self.log(f"Market changed: {old_slug} -> {new_slug}", "warning")
-            # Keep old-market positions tracked through resolution.
-            # They will be cleared by wallet sync when conditional token
-            # balances settle to zero after resolution/redemption.
-            open_positions = self.positions.get_all_positions()
-            if open_positions:
-                self.log(
-                    "Keeping open positions for settlement; not force-closing on market switch.",
-                    "warning",
-                )
+            switched_from_resolution = bool(getattr(self.market, "last_switch_from_resolution", False))
+            detached = 0
+            if switched_from_resolution:
+                # During resolution rollover, detach old-market positions from local
+                # tracking so next market entries are not blocked by stale state.
+                for pos in list(self.positions.get_all_positions()):
+                    pos_slug = getattr(pos, "market_slug", "")
+                    if pos_slug != new_slug:
+                        self._detach_position_for_resolution_rollover(
+                            pos,
+                            reason=f"market rotated to {new_slug}; settlement carryover",
+                        )
+                        detached += 1
+                if detached > 0:
+                    self.log(
+                        f"Detached {detached} old-market position(s) from local tracking after resolution rollover.",
+                        "warning",
+                    )
+            else:
+                # Non-resolution switch: preserve local positions to avoid dropping
+                # state during transient feed/slug changes.
+                open_positions = self.positions.get_all_positions()
+                if open_positions:
+                    self.log(
+                        "Keeping open positions; market switch was not from resolution.",
+                        "warning",
+                    )
             self.prices.clear()
             self._log_buffer.clear()
             self._last_blocked_buy_slug = None
@@ -960,6 +978,21 @@ class BaseStrategy(ABC):
             return max(0.0, balance_shares)
         return None
 
+    def _detach_position_for_resolution_rollover(self, position: Position, reason: str) -> None:
+        """
+        Remove position from local tracking during resolution rollover only.
+
+        This intentionally does not emit an "exit" telemetry event because
+        execution did not happen in this process; the position still exists
+        on Polymarket and will settle externally.
+        """
+        self._partial_tp_state.pop(position.id, None)
+        self.positions.close_position(position.id, realized_pnl=0.0)
+        self.log(
+            f"Resolution rollover: detached local {position.side.upper()} position ({reason})",
+            "warning",
+        )
+
     def _close_position_as_external_exit(
         self,
         position: Position,
@@ -993,10 +1026,11 @@ class BaseStrategy(ABC):
                 "hold_seconds": round(position.get_hold_time(), 3),
             }
         )
-        market = self.current_market
-        current_slug = market.slug if market else ""
-        if current_slug:
-            self._completed_market_slugs.add(current_slug)
+        # Mark the position's own market as completed. Using current_market here
+        # can be wrong during rotation callbacks where current_market is already new.
+        closed_slug = getattr(position, "market_slug", "") or self._market_slug()
+        if closed_slug:
+            self._completed_market_slugs.add(closed_slug)
 
     async def execute_buy(self, side: str, current_price: float) -> bool:
         """

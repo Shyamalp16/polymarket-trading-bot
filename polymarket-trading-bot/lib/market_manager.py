@@ -178,6 +178,7 @@ class MarketManager:
         self._ws_connected = False
         self._ws_task: Optional[asyncio.Task] = None
         self._market_check_task: Optional[asyncio.Task] = None
+        self._last_switch_from_resolution: bool = False
 
         # Callbacks
         self._on_book_callbacks: List[BookCallback] = []
@@ -201,6 +202,11 @@ class MarketManager:
         if self.current_market:
             return self.current_market.token_ids
         return {}
+
+    @property
+    def last_switch_from_resolution(self) -> bool:
+        """Whether the most recent market switch came from a resolved market."""
+        return self._last_switch_from_resolution
 
     def get_orderbook(self, side: str) -> Optional[OrderbookSnapshot]:
         """
@@ -434,6 +440,7 @@ class MarketManager:
 
             # Market changed - force a fresh WS session for new tokens
             # (more reliable than in-place replace subscribe).
+            self._last_switch_from_resolution = bool(old_market and old_market.has_ended())
             self._update_current_market(market)
             restarted = await self._restart_websocket()
             if not restarted:
@@ -448,6 +455,7 @@ class MarketManager:
                         callback(old_slug, market.slug)
                     except Exception:
                         pass
+            self._last_switch_from_resolution = False
 
     async def start(self) -> bool:
         """
