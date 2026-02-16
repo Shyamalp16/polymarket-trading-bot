@@ -103,13 +103,12 @@ DEFAULTS_2X = dict(
 
     # Orderbook imbalance -- DISABLED (too small for 2x targets)
     imbalance_enabled=False,
-    imbalance_ratio_threshold=2.5,
+    imbalance_signal_threshold=0.20,
     imbalance_depth=5,
 
     # Time decay (convergence) -- activate at 25% remaining (~3:45 left)
     time_decay_enabled=True,
     time_decay_threshold_pct=0.25,
-    time_decay_min_divergence=0.12,     # Lower bar: catch more late-game plays
 
     # Signal combination -- lower score since only 2 high-conviction signals
     min_signal_score=0.5,
@@ -224,10 +223,9 @@ def main():
         momentum_threshold=DEFAULTS_2X["momentum_threshold"],
         momentum_min_ticks=DEFAULTS_2X["momentum_min_ticks"],
         momentum_consistency=DEFAULTS_2X["momentum_consistency"],
-        imbalance_ratio_threshold=DEFAULTS_2X["imbalance_ratio_threshold"],
+        imbalance_signal_threshold=DEFAULTS_2X["imbalance_signal_threshold"],
         imbalance_depth=DEFAULTS_2X["imbalance_depth"],
         time_decay_threshold_pct=DEFAULTS_2X["time_decay_threshold_pct"],
-        time_decay_min_divergence=DEFAULTS_2X["time_decay_min_divergence"],
         signal_cooldown=DEFAULTS_2X["signal_cooldown"],
         min_time_remaining=DEFAULTS_2X["min_time_remaining"],
     )
@@ -271,8 +269,7 @@ def main():
     if strategy_config.time_decay_enabled:
         signals.append(
             f"  {Colors.GREEN}ON {Colors.RESET} Time Decay    "
-            f"(< {strategy_config.time_decay_threshold_pct:.0%} remaining, "
-            f"div >= {strategy_config.time_decay_min_divergence:.2f})"
+            f"(< {strategy_config.time_decay_threshold_pct:.0%} remaining)"
         )
     else:
         signals.append(f"  {Colors.RED}OFF{Colors.RESET} Time Decay")
@@ -289,7 +286,7 @@ def main():
     if strategy_config.imbalance_enabled:
         signals.append(
             f"  {Colors.GREEN}ON {Colors.RESET} OB Imbalance  "
-            f"(ratio >= {strategy_config.imbalance_ratio_threshold:.1f}x)"
+            f"(score >= {strategy_config.imbalance_signal_threshold:.2f})"
         )
     else:
         signals.append(f"  {Colors.DIM}OFF{Colors.RESET} OB Imbalance  (use --with-imbalance to enable)")

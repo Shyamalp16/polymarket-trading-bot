@@ -20,8 +20,10 @@ Usage:
     await strategy.run()
 """
 
+import math
+import time
 from dataclasses import dataclass
-from typing import Dict
+from typing import Callable, Dict, Optional
 
 from lib.console import Colors, format_countdown
 from strategies.base import BaseStrategy, StrategyConfig
@@ -30,10 +32,42 @@ from src.websocket_client import OrderbookSnapshot
 
 
 @dataclass
+class AdaptiveCrashEvent:
+    """Adaptive flash crash event payload."""
+
+    side: str
+    old_price: float
+    new_price: float
+    drop: float
+    timestamp: float
+    z_score: float
+
+
+@dataclass
 class FlashCrashConfig(StrategyConfig):
     """Flash crash strategy configuration."""
 
     drop_threshold: float = 0.30  # Absolute probability drop
+    adaptive_detection_enabled: bool = True
+    adaptive_window_seconds: float = 5.0
+    adaptive_z_threshold: float = 2.5
+    adaptive_min_drop: float = 0.15
+    adaptive_min_returns: int = 12
+
+    # Spot-aware cause classification (optional provider)
+    spot_filter_enabled: bool = True
+    spot_informed_threshold_pct: float = 0.30
+    require_spot_data_for_entry: bool = False
+    spot_change_provider: Optional[Callable[[float], Optional[float]]] = None
+
+    # Time-gated entry and dynamic TP/SL assignment by time-to-expiry
+    skip_entry_below_seconds: int = 120
+    tp_far: float = 0.12      # > 10m
+    sl_far: float = 0.06
+    tp_mid: float = 0.08      # 5m - 10m
+    sl_mid: float = 0.05
+    tp_near: float = 0.05     # 2m - 5m
+    sl_near: float = 0.04
 
 
 class FlashCrashStrategy(BaseStrategy):
@@ -61,9 +95,35 @@ class FlashCrashStrategy(BaseStrategy):
         if not self.positions.can_open_position:
             return
 
-        # Detect flash crash
-        event = self.prices.detect_flash_crash()
+        # Detect flash crash (adaptive by default, legacy fallback available)
+        event = (
+            self._detect_adaptive_flash_crash()
+            if self.flash_config.adaptive_detection_enabled
+            else self.prices.detect_flash_crash()
+        )
         if event:
+            if not self._apply_entry_time_gate():
+                return
+
+            informed, spot_change = self._is_informed_flow(event.side)
+            if informed:
+                self.log(
+                    f"SUPPRESSED crash on {event.side.upper()}: "
+                    f"spot move={spot_change:+.2f}% (informed flow)",
+                    "warning",
+                )
+                return
+            if (
+                self.flash_config.spot_filter_enabled
+                and self.flash_config.require_spot_data_for_entry
+                and spot_change is None
+            ):
+                self.log(
+                    "SUPPRESSED crash: spot filter enabled but no spot data available",
+                    "warning",
+                )
+                return
+
             self.log(
                 f"FLASH CRASH: {event.side.upper()} "
                 f"drop {event.drop:.2f} ({event.old_price:.2f} -> {event.new_price:.2f})",
@@ -71,7 +131,142 @@ class FlashCrashStrategy(BaseStrategy):
             )
             current_price = prices.get(event.side, 0)
             if current_price > 0:
+                # TP/SL are set based on time remaining immediately before entry.
+                self._assign_entry_risk_profile()
                 await self.execute_buy(event.side, current_price)
+
+    def _detect_adaptive_flash_crash(self) -> Optional[AdaptiveCrashEvent]:
+        """
+        Detect crash using z-score over a short window with an absolute floor.
+
+        This avoids fixed-threshold rigidity across different price regimes.
+        """
+        now = time.time()
+        window = self.flash_config.adaptive_window_seconds
+
+        for side in ["up", "down"]:
+            history = self.prices.get_history(side)
+            if len(history) < (self.flash_config.adaptive_min_returns + 1):
+                continue
+
+            recent = [p for p in history if p.timestamp >= (now - window)]
+            if len(recent) < 2:
+                continue
+
+            current = recent[-1].price
+            local_peak = max(p.price for p in recent)
+            drop = local_peak - current
+            if drop < self.flash_config.adaptive_min_drop:
+                continue
+
+            # Build return distribution from the latest observations.
+            lookback = history[-(self.flash_config.adaptive_min_returns + 1):]
+            returns = [
+                lookback[i].price - lookback[i - 1].price
+                for i in range(1, len(lookback))
+            ]
+            if len(returns) < self.flash_config.adaptive_min_returns:
+                continue
+
+            mu = sum(returns) / len(returns)
+            var = sum((r - mu) ** 2 for r in returns) / max(1, len(returns) - 1)
+            sigma = math.sqrt(var) if var > 0 else 0.0
+            if sigma <= 1e-9:
+                continue
+
+            window_return = recent[-1].price - recent[0].price
+            steps = max(1, len(recent) - 1)
+            expected = mu * steps
+            expected_sigma = sigma * math.sqrt(steps)
+            z_score = (window_return - expected) / max(expected_sigma, 1e-9)
+
+            if z_score <= -self.flash_config.adaptive_z_threshold:
+                return AdaptiveCrashEvent(
+                    side=side,
+                    old_price=local_peak,
+                    new_price=current,
+                    drop=drop,
+                    timestamp=now,
+                    z_score=z_score,
+                )
+
+        return None
+
+    def _is_informed_flow(self, crashed_side: str) -> tuple[bool, Optional[float]]:
+        """
+        Classify event using optional BTC spot move input.
+
+        If spot moves significantly in the direction that explains the
+        crashed side move, treat it as informed and suppress mean reversion.
+        """
+        if not self.flash_config.spot_filter_enabled:
+            return (False, None)
+
+        spot_change = self._get_spot_change_pct(self.flash_config.adaptive_window_seconds)
+        if spot_change is None:
+            return (False, None)
+
+        if abs(spot_change) < self.flash_config.spot_informed_threshold_pct:
+            return (False, spot_change)
+
+        aligned = (crashed_side == "up" and spot_change < 0) or (
+            crashed_side == "down" and spot_change > 0
+        )
+        return (aligned, spot_change)
+
+    def _get_spot_change_pct(self, window_seconds: float) -> Optional[float]:
+        """Get BTC spot percentage move over a window from optional provider."""
+        provider = self.flash_config.spot_change_provider
+        if not provider:
+            return None
+        try:
+            return provider(window_seconds)
+        except Exception:
+            return None
+
+    def _seconds_remaining(self) -> Optional[int]:
+        market = self.current_market
+        if not market:
+            return None
+        mins, secs = market.get_countdown()
+        if mins < 0:
+            return None
+        return mins * 60 + secs
+
+    def _apply_entry_time_gate(self) -> bool:
+        """Skip new entries when there is not enough time for reversion."""
+        remaining = self._seconds_remaining()
+        if remaining is None:
+            return False
+        if remaining < self.flash_config.skip_entry_below_seconds:
+            self.log(
+                f"SKIP entry: {remaining}s remaining (<{self.flash_config.skip_entry_below_seconds}s)",
+                "warning",
+            )
+            return False
+        return True
+
+    def _assign_entry_risk_profile(self) -> None:
+        """
+        Set TP/SL by time-to-expiry before opening a new position.
+
+        >10m: wider target and stop
+        5-10m: moderate
+        2-5m: tighter convergence profile
+        """
+        remaining = self._seconds_remaining()
+        if remaining is None:
+            return
+
+        if remaining > 600:
+            tp, sl = self.flash_config.tp_far, self.flash_config.sl_far
+        elif remaining > 300:
+            tp, sl = self.flash_config.tp_mid, self.flash_config.sl_mid
+        else:
+            tp, sl = self.flash_config.tp_near, self.flash_config.sl_near
+
+        self.positions.take_profit = tp
+        self.positions.stop_loss = sl
 
     def render_status(self, prices: Dict[str, float]) -> None:
         """Render TUI status display."""
@@ -128,7 +323,13 @@ class FlashCrashStrategy(BaseStrategy):
         down_history = self.prices.get_history_count("down")
         lines.append(
             f"History: UP={up_history}/100 DOWN={down_history}/100 | "
-            f"Drop threshold: {self.flash_config.drop_threshold:.2f} in {self.config.price_lookback_seconds}s"
+            f"Detector: {'adaptive-z' if self.flash_config.adaptive_detection_enabled else 'fixed'} | "
+            f"Window: {self.flash_config.adaptive_window_seconds:.1f}s | "
+            f"MinDrop: {self.flash_config.adaptive_min_drop:.2f}"
+        )
+        lines.append(
+            f"Risk profile: TP={self.positions.take_profit:.0%} SL={self.positions.stop_loss:.0%} | "
+            f"Entry gate: >= {self.flash_config.skip_entry_below_seconds}s remaining"
         )
 
         lines.append(f"{Colors.BOLD}{'='*80}{Colors.RESET}")

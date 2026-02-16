@@ -274,6 +274,7 @@ class Config:
             BUILDER_API_PASSPHRASE: Builder Program passphrase
             CLOB_HOST: CLOB API host
             CHAIN_ID: Chain ID (default: 137)
+            SIGNATURE_TYPE: 0=EOA, 1=Email/Magic proxy, 2=Browser wallet proxy
             DATA_DIR: Data directory for credentials
             LOG_LEVEL: Logging level
 
@@ -305,13 +306,17 @@ class Config:
         # CLOB config
         clob_host = get_env("CLOB_HOST")
         chain_id = get_env_int("CHAIN_ID", 137)
+        signature_type = get_env_int("SIGNATURE_TYPE", -1)
         if clob_host:
             config.clob = ClobConfig(
                 host=clob_host,
                 chain_id=chain_id,
+                signature_type=signature_type if signature_type >= 0 else config.clob.signature_type,
             )
         elif chain_id != 137:
             config.clob.chain_id = chain_id
+        if signature_type >= 0:
+            config.clob.signature_type = signature_type
 
         # Other settings
         data_dir = get_env("DATA_DIR")
@@ -372,6 +377,11 @@ class Config:
             config.builder.api_secret = api_secret
         if api_passphrase:
             config.builder.api_passphrase = api_passphrase
+
+        # CLOB overrides
+        signature_type = get_env_int("SIGNATURE_TYPE", -1)
+        if signature_type >= 0:
+            config.clob.signature_type = signature_type
 
         # Other settings
         data_dir = get_env("DATA_DIR")

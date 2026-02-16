@@ -694,10 +694,11 @@ class ClobClient(ApiClient):
         body_json = json.dumps(body, separators=(',', ':'))
         headers = self._build_headers("DELETE", endpoint, body_json)
 
+        # Send exact body string used for HMAC so server verification succeeds
         return self._request(
             "DELETE",
             endpoint,
-            data=body,
+            data=body_json,
             headers=headers
         )
 
@@ -715,10 +716,11 @@ class ClobClient(ApiClient):
         body_json = json.dumps(order_ids, separators=(',', ':'))
         headers = self._build_headers("DELETE", endpoint, body_json)
 
+        # Send exact body string used for HMAC so server verification succeeds
         return self._request(
             "DELETE",
             endpoint,
-            data=order_ids,
+            data=body_json,
             headers=headers
         )
 
@@ -764,10 +766,11 @@ class ClobClient(ApiClient):
         body_json = json.dumps(body, separators=(',', ':')) if body else ""
         headers = self._build_headers("DELETE", endpoint, body_json)
 
+        # Send exact body string used for HMAC so server verification succeeds
         return self._request(
             "DELETE",
             endpoint,
-            data=body if body else None,
+            data=body_json if body_json else None,
             headers=headers
         )
 
@@ -854,7 +857,7 @@ class RelayerClient(ApiClient):
         return self._request(
             "POST",
             endpoint,
-            data=body,
+            data=body_json,
             headers=headers
         )
 
@@ -887,7 +890,7 @@ class RelayerClient(ApiClient):
         return self._request(
             "POST",
             endpoint,
-            data=body,
+            data=body_json,
             headers=headers
         )
 
@@ -923,6 +926,6 @@ class RelayerClient(ApiClient):
         return self._request(
             "POST",
             endpoint,
-            data=body,
+            data=body_json,
             headers=headers
         )

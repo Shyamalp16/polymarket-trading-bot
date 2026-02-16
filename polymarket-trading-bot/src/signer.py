@@ -65,8 +65,8 @@ class Order:
         if self.side not in ("BUY", "SELL"):
             raise ValueError(f"Invalid side: {self.side}")
 
-        if not 0 < self.price <= 1:
-            raise ValueError(f"Invalid price: {self.price}")
+        if not 0 < self.price <= 0.99:
+            raise ValueError(f"Invalid price: {self.price} (SDK max is 0.99)")
 
         if self.size <= 0:
             raise ValueError(f"Invalid size: {self.size}")

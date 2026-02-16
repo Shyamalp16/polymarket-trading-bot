@@ -90,7 +90,7 @@ class OrderResult:
 
         return cls(
             success=actually_ok,
-            order_id=response.get("orderID"),  # Polymarket uses capital D
+            order_id=response.get("orderID") or response.get("orderId"),  # API may use orderID or orderId
             status=response.get("status"),
             message=error_msg if error_msg else ("Order placed successfully" if actually_ok else "Unknown error"),
             data=response
@@ -351,6 +351,9 @@ class TradingBot:
             neg_risk = await self._run_in_thread(
                 self.clob_client.get_neg_risk, token_id
             )
+
+            # Clamp price to SDK maximum of 0.99
+            price = min(price, 0.99)
 
             # Create order (pass order_type so amounts satisfy
             # the correct precision rules for GTC vs FOK/FAK)

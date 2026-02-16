@@ -86,13 +86,12 @@ DEFAULTS_15M = dict(
 
     # Orderbook imbalance -- higher ratio since books are deeper
     imbalance_enabled=True,
-    imbalance_ratio_threshold=2.5,
+    imbalance_signal_threshold=0.20,
     imbalance_depth=5,
 
     # Time decay (convergence) -- activate in last 20% (~3 minutes)
     time_decay_enabled=True,
     time_decay_threshold_pct=0.20,
-    time_decay_min_divergence=0.15,
 
     # Signal combination -- more selective
     min_signal_score=0.7,
@@ -215,10 +214,9 @@ def main():
         momentum_threshold=DEFAULTS_15M["momentum_threshold"],
         momentum_min_ticks=DEFAULTS_15M["momentum_min_ticks"],
         momentum_consistency=DEFAULTS_15M["momentum_consistency"],
-        imbalance_ratio_threshold=DEFAULTS_15M["imbalance_ratio_threshold"],
+        imbalance_signal_threshold=DEFAULTS_15M["imbalance_signal_threshold"],
         imbalance_depth=DEFAULTS_15M["imbalance_depth"],
         time_decay_threshold_pct=DEFAULTS_15M["time_decay_threshold_pct"],
-        time_decay_min_divergence=DEFAULTS_15M["time_decay_min_divergence"],
         signal_cooldown=DEFAULTS_15M["signal_cooldown"],
         min_time_remaining=DEFAULTS_15M["min_time_remaining"],
     )
@@ -253,7 +251,7 @@ def main():
         signals.append(f"  {Colors.RED}OFF{Colors.RESET} Momentum")
 
     if strategy_config.imbalance_enabled:
-        signals.append(f"  {Colors.GREEN}ON{Colors.RESET}  OB Imbalance  (ratio >= {strategy_config.imbalance_ratio_threshold:.1f}x)")
+        signals.append(f"  {Colors.GREEN}ON{Colors.RESET}  OB Imbalance  (score >= {strategy_config.imbalance_signal_threshold:.2f})")
     else:
         signals.append(f"  {Colors.RED}OFF{Colors.RESET} OB Imbalance")
 
