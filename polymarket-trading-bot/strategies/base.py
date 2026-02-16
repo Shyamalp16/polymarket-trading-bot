@@ -58,6 +58,7 @@ class StrategyConfig:
     # Display settings
     update_interval: float = 0.1
     order_refresh_interval: float = 30.0  # Seconds between order refreshes
+    wallet_sync_interval: float = 3.0     # Seconds between wallet/position reconciliation
 
 
 class BaseStrategy(ABC):
@@ -112,6 +113,7 @@ class BaseStrategy(ABC):
         self._cached_orders: List[dict] = []
         self._last_order_refresh: float = 0
         self._order_refresh_task: Optional[asyncio.Task] = None
+        self._last_wallet_sync: float = 0.0
         # Recovery state for empty-book periods after market rotation.
         self._no_data_since: float = 0.0
         self._last_data_recovery_at: float = 0.0
@@ -289,6 +291,10 @@ class BaseStrategy(ABC):
                 # Call tick handler
                 await self.on_tick(prices)
 
+                # Reconcile tracked positions with wallet balances so
+                # manual/external sells do not leave stale open positions.
+                await self._sync_positions_with_wallet(prices)
+
                 # Check position exits
                 await self._check_exits(prices)
 
@@ -400,6 +406,63 @@ class BaseStrategy(ABC):
 
             # Execute sell
             await self.execute_sell(position, prices.get(position.side, 0))
+
+    async def _sync_positions_with_wallet(self, prices: Dict[str, float]) -> None:
+        """
+        Reconcile in-memory positions with wallet balances.
+
+        This catches manual UI sells (or any external wallet action) and keeps
+        local position state aligned with actual token balances.
+        """
+        if self.config.wallet_sync_interval <= 0:
+            return
+
+        now = time.time()
+        if (now - self._last_wallet_sync) < self.config.wallet_sync_interval:
+            return
+        self._last_wallet_sync = now
+
+        open_positions = self.positions.get_all_positions()
+        if not open_positions:
+            return
+
+        for pos in list(open_positions):
+            try:
+                await self.bot.update_balance_allowance("CONDITIONAL", pos.token_id)
+                tradable = await self._get_tradable_shares(pos.token_id)
+            except Exception:
+                continue
+
+            if tradable is None:
+                continue
+
+            tracked_size = max(0.0, int(pos.size * 100) / 100.0)
+            wallet_size = max(0.0, int(tradable * 100) / 100.0)
+            size_delta = tracked_size - wallet_size
+
+            # Ignore tiny rounding differences.
+            if size_delta < 0.01:
+                continue
+
+            if wallet_size < 0.01:
+                self.positions.close_position(pos.id, realized_pnl=0.0)
+                self.log(
+                    f"Wallet sync: external sell closed {pos.side.upper()} position "
+                    f"(tracked={tracked_size:.2f}, wallet={wallet_size:.2f})",
+                    "warning",
+                )
+                market = self.current_market
+                current_slug = market.slug if market else ""
+                if current_slug:
+                    self._completed_market_slugs.add(current_slug)
+                continue
+
+            pos.size = wallet_size
+            self.log(
+                f"Wallet sync: adjusted {pos.side.upper()} size "
+                f"{tracked_size:.2f} -> {wallet_size:.2f} (external partial sell)",
+                "warning",
+            )
 
     @staticmethod
     def _normalize_shares(value: Optional[object]) -> Optional[float]:

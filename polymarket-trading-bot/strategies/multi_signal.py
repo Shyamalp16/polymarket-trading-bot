@@ -127,16 +127,19 @@ class MultiSignalConfig(StrategyConfig):
 
     # --- Flow toxicity signal ---
     flow_toxicity_enabled: bool = True
-    flow_toxicity_weight: float = 0.10
+    flow_toxicity_weight: float = 0.00
     flow_toxicity_spread_threshold: float = 0.08
     flow_toxicity_min_imbalance: float = 0.15
     flow_toxicity_strength_scale: float = 0.50
+    flow_toxicity_veto_threshold: float = 0.60
 
     # --- Signal combination ---
     min_signal_score: float = 0.7       # Min combined score to enter
-    dynamic_threshold_base: float = 0.65
+    dynamic_threshold_base: float = 0.35
     dynamic_threshold_vol_adjustment: float = 0.15
     dynamic_threshold_enabled: bool = True
+    dynamic_threshold_max: float = 0.45
+    dynamic_threshold_warmup_samples: int = 60
     threshold_volatility_window: float = 45.0
     volatility_history_size: int = 180
     signal_cooldown: float = 12.0       # Seconds between entries
@@ -153,6 +156,9 @@ class MultiSignalConfig(StrategyConfig):
     pair_penalty_imbalance_flow: float = 0.55
     regime_low_vol_percentile: float = 0.25
     regime_high_vol_percentile: float = 0.75
+    conflict_min_strength: float = 0.30
+    conflict_balance_ratio: float = 0.60
+    conflict_skip_enabled: bool = True
 
     # --- Safety ---
     min_time_remaining: int = 60        # Don't open positions with less time (seconds)
@@ -166,8 +172,8 @@ class MultiSignalConfig(StrategyConfig):
     cross_timeframe_enabled: bool = True
     cross_timeframe_align_boost: float = 1.10
     cross_timeframe_conflict_penalty: float = 0.90
-    toxicity_size_impact: float = 0.50
-    min_size_multiplier: float = 0.25
+    toxicity_size_impact: float = 1.00
+    min_size_multiplier: float = 0.30
 
     # --- Re-entry controls ---
     max_entries_per_window: int = 2
@@ -179,6 +185,10 @@ class MultiSignalConfig(StrategyConfig):
     bankroll_provider: Optional[Callable[[], Optional[float]]] = None
     kelly_fraction: float = 0.25
     kelly_max_pct: float = 0.05
+
+    # --- Diagnostics ---
+    signal_state_logging_enabled: bool = False
+    signal_state_log_interval_sec: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +226,17 @@ class MultiSignalStrategy(BaseStrategy):
         self._recent_trade_times: Deque[float] = deque(maxlen=10)
         self._window_entries: Dict[str, List[dict]] = {}
         self._window_total_pnl: Dict[str, float] = {}
+        self._last_signal_state_log_time: float = 0.0
+        self._last_signal_state_lines: List[str] = []
+        self._last_raw_signal_state: Dict[str, float] = {}
+        self._last_conflict_reason: str = ""
+        self._last_entry_gate: Dict[str, object] = {
+            "ts": 0.0,
+            "side": "",
+            "composite": 0.0,
+            "threshold": 0.0,
+            "pass": False,
+        }
 
     # ------------------------------------------------------------------
     # BaseStrategy hooks
@@ -260,12 +281,15 @@ class MultiSignalStrategy(BaseStrategy):
             signals.extend(self._check_time_decay(prices))
         if self.signal_config.spot_divergence_enabled:
             signals.extend(self._check_spot_divergence(prices))
-        if self.signal_config.flow_toxicity_enabled:
-            signals.extend(self._check_flow_toxicity(prices))
 
         self._last_signals = signals
 
         if not signals:
+            return
+
+        conflict, conflict_reason = self._detect_conflict(signals)
+        self._last_conflict_reason = conflict_reason
+        if conflict and self.signal_config.conflict_skip_enabled:
             return
 
         # Aggregate scores per side with decorrelation penalties
@@ -281,8 +305,10 @@ class MultiSignalStrategy(BaseStrategy):
         best_score = side_scores[best_side]
         best_score *= self._cross_timeframe_multiplier(best_side)
         min_score = self._entry_threshold()
+        self._last_raw_signal_state = self._build_raw_signal_state(prices, best_side)
+        self._maybe_log_signal_state(signals, side_scores, best_score, min_score)
 
-        if best_score >= min_score:
+        if self._entry_check(best_score, min_score, best_side):
             if not self._can_enter_window(now, best_score):
                 return
 
@@ -306,6 +332,11 @@ class MultiSignalStrategy(BaseStrategy):
                     base_size = min(base_size, float(size_cap))
 
                 toxicity = self._flow_toxicity_score(best_side, current_price)
+                if (
+                    self.signal_config.flow_toxicity_enabled
+                    and toxicity >= self.signal_config.flow_toxicity_veto_threshold
+                ):
+                    return
                 toxicity_mult = max(
                     self.signal_config.min_size_multiplier,
                     1.0 - (self.signal_config.toxicity_size_impact * toxicity),
@@ -327,6 +358,13 @@ class MultiSignalStrategy(BaseStrategy):
                     )
                     self._last_signal_time = now
                     self._total_signals_fired += 1
+        else:
+            # Keep a human-readable trace in the strategy log buffer.
+            self.log(
+                f"[ENTRY BLOCKED] side={best_side.upper()} "
+                f"composite={best_score:.3f} threshold={min_score:.3f}",
+                "info",
+            )
 
     # ------------------------------------------------------------------
     # Signal detectors
@@ -334,99 +372,92 @@ class MultiSignalStrategy(BaseStrategy):
 
     def _check_flash_crash(self, prices: Dict[str, float]) -> List[TradeSignal]:
         """
-        Flash Crash Detector (Mean Reversion).
-
-        Triggers when a side's probability drops rapidly within the
-        lookback window. Score scales with drop magnitude.
+        Flash crash detector with continuous scoring.
         """
         signals: List[TradeSignal] = []
-        event = self.prices.detect_flash_crash()
-
-        if event:
-            # Score: proportional to drop / threshold, capped at 1.5
-            strength = min(event.drop / max(self.signal_config.drop_threshold, 1e-9), 1.0)
-            confidence = min(1.0, 0.65 + 0.35 * strength)
-            signals.append(TradeSignal(
-                side=event.side,
-                raw_score=strength,
-                confidence=confidence,
-                reason=f"crash:{event.drop:.2f}",
-                source="flash",
-            ))
+        window = float(self.config.price_lookback_seconds)
+        for side in ["up", "down"]:
+            drop = self._flash_drop(side, window)
+            # Continuous normalization: non-zero input produces non-zero score.
+            strength = self._sigmoid_normalize(drop, self.signal_config.drop_threshold)
+            confidence = min(1.0, 0.55 + 0.45 * strength)
+            # Contrarian mean-reversion mapping:
+            # price drop on one side votes for the opposite side.
+            target_side = "down" if side == "up" else "up"
+            signals.append(
+                TradeSignal(
+                    side=target_side,
+                    raw_score=strength,
+                    confidence=confidence,
+                    reason=f"crash:{side}->{target_side}:{drop:.3f}",
+                    source="flash",
+                )
+            )
 
         return signals
 
     def _check_momentum(self, prices: Dict[str, float]) -> List[TradeSignal]:
         """
-        Momentum Detector (Trend Following).
+        Momentum detector with canonical direction.
 
-        Checks each side for consistent directional price movement
-        within the momentum window. Only triggers when both the total
-        move exceeds the threshold AND the consistency ratio is met.
+        We compute a single signed momentum value from the UP side when
+        available (fallback to DOWN inverted), then map:
+        +momentum -> UP, -momentum -> DOWN.
         """
-        signals: List[TradeSignal] = []
         now = time.time()
         cutoff = now - self.signal_config.momentum_window
+        up_recent = [p for p in self.prices.get_history("up") if p.timestamp >= cutoff]
+        down_recent = [p for p in self.prices.get_history("down") if p.timestamp >= cutoff]
 
-        for side in ["up", "down"]:
-            history = self.prices.get_history(side)
-            recent = [p for p in history if p.timestamp >= cutoff]
+        # Prefer UP-side momentum as canonical direction; fallback to DOWN inverted.
+        recent = up_recent
+        source_side = "up"
+        invert_sign = 1.0
+        if len(recent) < self.signal_config.momentum_min_ticks and len(down_recent) >= self.signal_config.momentum_min_ticks:
+            recent = down_recent
+            source_side = "down"
+            invert_sign = -1.0
+        if len(recent) < self.signal_config.momentum_min_ticks:
+            return []
 
-            if len(recent) < self.signal_config.momentum_min_ticks:
-                continue
+        raw_move = recent[-1].price - recent[0].price
+        canonical_move = raw_move * invert_sign
+        if abs(canonical_move) <= 1e-9:
+            return []
 
-            # Total price move over window
-            total_move = recent[-1].price - recent[0].price
-            if abs(total_move) < self.signal_config.momentum_threshold:
-                continue
+        up_ticks = 0
+        down_ticks = 0
+        for i in range(1, len(recent)):
+            diff = (recent[i].price - recent[i - 1].price) * invert_sign
+            if diff > 0.001:
+                up_ticks += 1
+            elif diff < -0.001:
+                down_ticks += 1
+        total_ticks = up_ticks + down_ticks
+        if total_ticks == 0:
+            return []
 
-            # Count directional ticks for consistency check
-            up_ticks = 0
-            down_ticks = 0
-            for i in range(1, len(recent)):
-                diff = recent[i].price - recent[i - 1].price
-                if diff > 0.001:
-                    up_ticks += 1
-                elif diff < -0.001:
-                    down_ticks += 1
+        move_strength = self._sigmoid_normalize(
+            abs(canonical_move),
+            self.signal_config.momentum_threshold,
+        )
+        consistency = (up_ticks / total_ticks) if canonical_move > 0 else (down_ticks / total_ticks)
+        consistency_strength = self._sigmoid_normalize(
+            consistency,
+            self.signal_config.momentum_consistency,
+        )
+        confidence = min(1.0, max(0.0, consistency_strength))
+        target_side = "up" if canonical_move > 0 else "down"
 
-            total_ticks = up_ticks + down_ticks
-            if total_ticks == 0:
-                continue
-
-            if total_move > 0:
-                # Price rising on this side -> bullish for this side
-                consistency = up_ticks / total_ticks
-                if consistency >= self.signal_config.momentum_consistency:
-                    strength = min(
-                        total_move / self.signal_config.momentum_threshold, 1.0
-                    )
-                    confidence = min(1.0, max(0.0, consistency))
-                    signals.append(TradeSignal(
-                        side=side,
-                        raw_score=strength,
-                        confidence=confidence,
-                        reason=f"mom:+{total_move:.3f}",
-                        source="momentum",
-                    ))
-            else:
-                # Price falling on this side -> bullish for the OTHER side
-                consistency = down_ticks / total_ticks
-                if consistency >= self.signal_config.momentum_consistency:
-                    other_side = "down" if side == "up" else "up"
-                    strength = min(
-                        abs(total_move) / self.signal_config.momentum_threshold, 1.0
-                    )
-                    confidence = min(1.0, max(0.0, consistency))
-                    signals.append(TradeSignal(
-                        side=other_side,
-                        raw_score=strength,
-                        confidence=confidence,
-                        reason=f"mom:{side}-{abs(total_move):.3f}",
-                        source="momentum",
-                    ))
-
-        return signals
+        return [
+            TradeSignal(
+                side=target_side,
+                raw_score=move_strength,
+                confidence=confidence,
+                reason=f"mom:{source_side}:{canonical_move:+.3f}",
+                source="momentum",
+            )
+        ]
 
     def _check_orderbook_imbalance(self) -> List[TradeSignal]:
         """
@@ -459,22 +490,14 @@ class MultiSignalStrategy(BaseStrategy):
                 continue
 
             imbalance = self._depth_weighted_imbalance(bid_levels, ask_levels, depth)
-            if imbalance <= self.signal_config.imbalance_signal_threshold:
-                continue
 
             self._record_book_snapshot(side, bid_levels, ask_levels)
             if self._detect_spoof(side):
                 continue
 
-            normalized = min(
-                1.0,
-                max(
-                    0.0,
-                    (
-                        (imbalance - self.signal_config.imbalance_signal_threshold)
-                        / (1.0 - self.signal_config.imbalance_signal_threshold)
-                    ),
-                ),
+            normalized = self._sigmoid_normalize(
+                max(0.0, imbalance),
+                self.signal_config.imbalance_signal_threshold,
             )
             confidence = min(1.0, 0.55 + 0.45 * normalized)
             signals.append(TradeSignal(
@@ -582,9 +605,128 @@ class MultiSignalStrategy(BaseStrategy):
             )
         return out
 
+    def _detect_conflict(self, signals: List[TradeSignal]) -> tuple[bool, str]:
+        """
+        Detect balanced up/down pressure conflict and optionally skip entries.
+        """
+        up_strength = 0.0
+        down_strength = 0.0
+        for s in signals:
+            eff = s.raw_score * s.confidence * self._source_weight(s.source)
+            if s.side == "up":
+                up_strength += eff
+            elif s.side == "down":
+                down_strength += eff
+
+        if up_strength <= 0.0 and down_strength <= 0.0:
+            return (False, "")
+        if (
+            up_strength > self.signal_config.conflict_min_strength
+            and down_strength > self.signal_config.conflict_min_strength
+        ):
+            ratio = min(up_strength, down_strength) / max(up_strength, down_strength)
+            if ratio > self.signal_config.conflict_balance_ratio:
+                return (
+                    True,
+                    f"conflict up={up_strength:.3f} down={down_strength:.3f} ratio={ratio:.2f}",
+                )
+        return (False, "")
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sigmoid_normalize(raw_value: float, soft_threshold: float) -> float:
+        """
+        Sigmoid normalization that remains continuous around threshold.
+        """
+        t = max(soft_threshold, 1e-9)
+        x = (raw_value / t) - 1.0
+        val = 1.0 / (1.0 + math.exp(-4.0 * x))
+        return max(0.0, min(1.0, val))
+
+    def _flash_drop(self, side: str, window_sec: float) -> float:
+        """
+        Max drop over a lookback window for one side.
+        """
+        history = self.prices.get_history(side)
+        if len(history) < 2:
+            return 0.0
+        cutoff = time.time() - window_sec
+        recent = [p for p in history if p.timestamp >= cutoff]
+        if len(recent) < 2:
+            return 0.0
+        current = recent[-1].price
+        peak = max(p.price for p in recent)
+        return max(0.0, peak - current)
+
+    def _orderbook_bid_ask_ratio(self, side: str, levels: int) -> float:
+        """
+        Weighted bid/ask pressure ratio for diagnostics.
+        """
+        ob = self.market.get_orderbook(side)
+        if not ob or not ob.bids or not ob.asks:
+            return 0.0
+        decay = self.signal_config.imbalance_decay
+        bid_pressure = sum(level.size * (decay ** i) for i, level in enumerate(ob.bids[:levels]))
+        ask_pressure = sum(level.size * (decay ** i) for i, level in enumerate(ob.asks[:levels]))
+        if ask_pressure <= 0:
+            return 0.0
+        return bid_pressure / ask_pressure
+
+    def _momentum_value(self, side: str, window_sec: float) -> float:
+        """Return signed momentum over window for diagnostics."""
+        history = self.prices.get_history(side)
+        if len(history) < 2:
+            return 0.0
+        cutoff = time.time() - window_sec
+        recent = [p for p in history if p.timestamp >= cutoff]
+        if len(recent) < 2:
+            return 0.0
+        return recent[-1].price - recent[0].price
+
+    def _build_raw_signal_state(self, prices: Dict[str, float], best_side: str) -> Dict[str, float]:
+        """
+        Build raw-feature snapshot for diagnostics.
+        """
+        max_drop = max(
+            self._flash_drop("up", 10.0),
+            self._flash_drop("down", 10.0),
+        )
+        momentum_up_30s = self._momentum_value("up", 30.0)
+        momentum_down_30s = self._momentum_value("down", 30.0)
+        # Canonical momentum: UP-side move (fallback to inverted DOWN-side move).
+        momentum_30s = (
+            momentum_up_30s
+            if abs(momentum_up_30s) > 1e-9
+            else (-momentum_down_30s)
+        )
+        ob_ratio = max(
+            self._orderbook_bid_ask_ratio("up", self.signal_config.imbalance_depth),
+            self._orderbook_bid_ask_ratio("down", self.signal_config.imbalance_depth),
+        )
+        market = self.current_market
+        time_remaining = 0.0
+        if market:
+            mins, secs = market.get_countdown()
+            if mins >= 0:
+                time_remaining = float(mins * 60 + secs)
+        current_prob = prices.get(best_side, max(prices.values()) if prices else 0.0)
+        vpin_proxy = max(
+            self._flow_toxicity_score("up", prices.get("up", 0.0)),
+            self._flow_toxicity_score("down", prices.get("down", 0.0)),
+        )
+        return {
+            "max_10s_drop": max_drop,
+            "momentum_30s": momentum_30s,
+            "momentum_up_30s": momentum_up_30s,
+            "momentum_down_30s": momentum_down_30s,
+            "ob_ratio": ob_ratio,
+            "time_remaining_s": time_remaining,
+            "current_prob": current_prob,
+            "vpin_proxy": vpin_proxy,
+        }
 
     def _source_weight(self, source: str) -> float:
         cfg = self.signal_config
@@ -665,17 +807,21 @@ class MultiSignalStrategy(BaseStrategy):
             if not dir_signals:
                 continue
 
-            raw_weighted = sum(
+            # Compute effective contribution first (raw * confidence * weight).
+            # Correlation penalties should be applied on effective overlap,
+            # otherwise a zero-weight source can still suppress the score.
+            effective_scores = [
                 s.raw_score * s.confidence * self._source_weight(s.source)
                 for s in dir_signals
-            )
+            ]
+            raw_weighted = sum(effective_scores)
             penalty = 0.0
             for i, s1 in enumerate(dir_signals):
-                for s2 in dir_signals[i + 1:]:
+                for j, s2 in enumerate(dir_signals[i + 1:], start=i + 1):
                     pair_pen = self._pair_penalty(s1.source, s2.source)
                     if pair_pen <= 0:
                         continue
-                    overlap = min(s1.raw_score, s2.raw_score)
+                    overlap = min(effective_scores[i], effective_scores[j])
                     penalty += pair_pen * overlap
 
             out[direction] = max(0.0, raw_weighted - penalty)
@@ -975,12 +1121,42 @@ class MultiSignalStrategy(BaseStrategy):
         """
         Execute buy with temporary size override.
         """
+        gate_ts = float(self._last_entry_gate.get("ts", 0.0))
+        gate_side = str(self._last_entry_gate.get("side", ""))
+        gate_pass = bool(self._last_entry_gate.get("pass", False))
+        if (not gate_pass) or gate_side != side or (time.time() - gate_ts) > 2.0:
+            self.log(
+                f"[ENTRY BLOCKED] stale/failed gate side={side.upper()} "
+                f"pass={gate_pass} gate_side={gate_side.upper() if gate_side else '?'}",
+                "warning",
+            )
+            return False
+
         old_size = self.config.size
         self.config.size = max(0.0, float(size_usdc))
         try:
             return await self.execute_buy(side, current_price)
         finally:
             self.config.size = old_size
+
+    def _entry_check(self, composite: float, threshold: float, side: str) -> bool:
+        """
+        Single source of truth for threshold gating.
+        """
+        passed = composite >= threshold
+        self._last_entry_gate = {
+            "ts": time.time(),
+            "side": side,
+            "composite": composite,
+            "threshold": threshold,
+            "pass": passed,
+        }
+        self.log(
+            f"[ENTRY CHECK] side={side.upper()} composite={composite:.3f} "
+            f"threshold={threshold:.3f} pass={passed}",
+            "info",
+        )
+        return passed
 
     def _can_enter_window(self, now: float, signal_score: float) -> bool:
         """
@@ -1036,12 +1212,70 @@ class MultiSignalStrategy(BaseStrategy):
             self._volatility_samples.append(current_vol)
         if not self._volatility_samples:
             return cfg.dynamic_threshold_base
+        if len(self._volatility_samples) < cfg.dynamic_threshold_warmup_samples:
+            return cfg.dynamic_threshold_base
 
         count_le = sum(1 for v in self._volatility_samples if v <= current_vol)
         volatility_percentile = count_le / len(self._volatility_samples)
-        return cfg.dynamic_threshold_base + (
+        dynamic = cfg.dynamic_threshold_base + (
             cfg.dynamic_threshold_vol_adjustment * volatility_percentile
         )
+        return min(cfg.dynamic_threshold_max, dynamic)
+
+    def _maybe_log_signal_state(
+        self,
+        signals: List[TradeSignal],
+        side_scores: Dict[str, float],
+        composite: float,
+        threshold: float,
+    ) -> None:
+        """Capture score diagnostics and render in persistent TUI section."""
+        cfg = self.signal_config
+        if not cfg.signal_state_logging_enabled:
+            return
+        now = time.time()
+        if now - self._last_signal_state_log_time < cfg.signal_state_log_interval_sec:
+            return
+        self._last_signal_state_log_time = now
+
+        lines: List[str] = [
+            f"[{time.strftime('%H:%M:%S')}] Composite: {composite:.3f} "
+            f"(threshold: {threshold:.3f}) "
+            f"[UP={side_scores.get('up', 0):.3f} DOWN={side_scores.get('down', 0):.3f}]"
+        ]
+        per_signal: Dict[str, float] = {}
+        for s in signals:
+            key = f"{s.source}_{s.side}"
+            per_signal[key] = max(per_signal.get(key, 0.0), s.score)
+        for name in sorted(per_signal.keys()):
+            score = per_signal[name]
+            bar = "#" * int(max(0.0, min(1.0, score)) * 20)
+            lines.append(f"  {name:20s}: {score:.3f} {bar}")
+        raw = self._last_raw_signal_state
+        if raw:
+            lines.append(
+                f"  [raw] 10s price drop   : {raw.get('max_10s_drop', 0.0):.4f}"
+            )
+            lines.append(
+                f"  [raw] 30s momentum     : {raw.get('momentum_30s', 0.0):.4f}"
+            )
+            lines.append(
+                f"  [raw] 30s mom up/down  : {raw.get('momentum_up_30s', 0.0):+.4f} / "
+                f"{raw.get('momentum_down_30s', 0.0):+.4f}"
+            )
+            lines.append(
+                f"  [raw] OB bid/ask ratio : {raw.get('ob_ratio', 0.0):.2f}"
+            )
+            lines.append(
+                f"  [raw] time remaining   : {raw.get('time_remaining_s', 0.0):.0f}s"
+            )
+            lines.append(
+                f"  [raw] current prob     : {raw.get('current_prob', 0.0):.3f}"
+            )
+            lines.append(
+                f"  [raw] VPIN proxy       : {raw.get('vpin_proxy', 0.0):.3f}"
+            )
+        self._last_signal_state_lines = lines
 
     def _is_too_close_to_expiry(self) -> bool:
         """Check if market is too close to expiry for new entries."""
@@ -1091,6 +1325,16 @@ class MultiSignalStrategy(BaseStrategy):
         self._recent_trade_times.clear()
         self._window_entries.clear()
         self._window_total_pnl.clear()
+        self._last_signal_state_lines = []
+        self._last_raw_signal_state = {}
+        self._last_conflict_reason = ""
+        self._last_entry_gate = {
+            "ts": 0.0,
+            "side": "",
+            "composite": 0.0,
+            "threshold": 0.0,
+            "pass": False,
+        }
 
     # ------------------------------------------------------------------
     # TUI Rendering
@@ -1208,6 +1452,23 @@ class MultiSignalStrategy(BaseStrategy):
                 f"{Colors.BOLD}Live Signals:{Colors.RESET} "
                 f"{Colors.DIM}(waiting for signals...){Colors.RESET}"
             )
+
+        if cfg.signal_state_logging_enabled:
+            lines.append(f"{Colors.BOLD}Signal Diagnostics:{Colors.RESET}")
+            if self._last_signal_state_lines:
+                for entry in self._last_signal_state_lines:
+                    lines.append(f"  {entry}")
+                if self._last_conflict_reason:
+                    lines.append(f"  conflict: {self._last_conflict_reason}")
+                gate = self._last_entry_gate
+                lines.append(
+                    f"  entry_gate: side={str(gate.get('side','')).upper() or '?'} "
+                    f"composite={float(gate.get('composite', 0.0)):.3f} "
+                    f"threshold={float(gate.get('threshold', 0.0)):.3f} "
+                    f"pass={bool(gate.get('pass', False))}"
+                )
+            else:
+                lines.append(f"  {Colors.DIM}(awaiting first diagnostic sample){Colors.RESET}")
 
         # Open Orders section
         lines.append(f"{Colors.BOLD}{'=' * 80}{Colors.RESET}")

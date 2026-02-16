@@ -75,12 +75,12 @@ DEFAULTS_5M = dict(
 
     # Flash crash (mean reversion) -- smaller threshold for fast markets
     flash_crash_enabled=True,
-    drop_threshold=0.15,
+    drop_threshold=0.08,
 
     # Momentum (trend following) -- short window, low threshold
     momentum_enabled=True,
     momentum_window=15,
-    momentum_threshold=0.06,
+    momentum_threshold=0.03,
     momentum_min_ticks=3,
     momentum_consistency=0.65,
 
@@ -94,7 +94,9 @@ DEFAULTS_5M = dict(
     time_decay_threshold_pct=0.30,
 
     # Signal combination
-    min_signal_score=0.6,
+    min_signal_score=0.35,
+    dynamic_threshold_base=0.35,
+    dynamic_threshold_vol_adjustment=0.10,
     signal_cooldown=8.0,
     min_time_remaining=30,
 )
@@ -161,6 +163,11 @@ def main():
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--signal-log",
+        action="store_true",
+        help="Print live composite + per-signal score bars",
+    )
 
     args = parser.parse_args()
 
@@ -217,6 +224,9 @@ def main():
         imbalance_signal_threshold=DEFAULTS_5M["imbalance_signal_threshold"],
         imbalance_depth=DEFAULTS_5M["imbalance_depth"],
         time_decay_threshold_pct=DEFAULTS_5M["time_decay_threshold_pct"],
+        dynamic_threshold_base=DEFAULTS_5M["dynamic_threshold_base"],
+        dynamic_threshold_vol_adjustment=DEFAULTS_5M["dynamic_threshold_vol_adjustment"],
+        signal_state_logging_enabled=args.signal_log,
         signal_cooldown=DEFAULTS_5M["signal_cooldown"],
         min_time_remaining=DEFAULTS_5M["min_time_remaining"],
     )
