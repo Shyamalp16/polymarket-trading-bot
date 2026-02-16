@@ -57,9 +57,11 @@ class StrategyConfig:
     partial_tp_force_sell_pct: float = 0.40
     partial_tp_depth_levels: int = 3
     partial_tp_max_depth_fraction: float = 0.25
+    partial_tp_step_cooldown_seconds: float = 12.0
     sell_retry_price_step: float = 0.01
     sell_retry_max_slippage: float = 0.03
     sell_retry_no_wait_on_fok: bool = True
+    exit_retrigger_cooldown_seconds: float = 3.0
 
     # Market settings
     market_duration: int = 15  # Market duration in minutes (5 or 15)
@@ -157,6 +159,7 @@ class BaseStrategy(ABC):
         self._balance_block_until: float = 0.0  # time.time() when next re-check allowed
         self._BALANCE_COOLDOWN: float = 60.0    # seconds between re-checks
         self._partial_tp_state: Dict[str, Dict[str, Any]] = {}
+        self._last_exit_attempt_at: Dict[str, float] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -527,6 +530,7 @@ class BaseStrategy(ABC):
         initial_sl = position.entry_price * (1 - self.config.stop_loss)
         state = {
             "step": 0,
+            "last_tp_ts": 0.0,
             "initial_size": float(position.size),
             "realized_proceeds": 0.0,
             "profile": self._partial_tp_profile(position.entry_price),
@@ -659,6 +663,13 @@ class BaseStrategy(ABC):
         step_idx = int(state.get("step", 0))
         if step_idx >= len(steps):
             return False
+        now = time.time()
+        last_tp_ts = float(state.get("last_tp_ts", 0.0))
+        if (
+            self.config.partial_tp_step_cooldown_seconds > 0
+            and (now - last_tp_ts) < self.config.partial_tp_step_cooldown_seconds
+        ):
+            return False
 
         total_window = max(1, int(self.config.market_duration * 60))
         time_frac = max(0.0, min(1.0, float(time_remaining_secs) / float(total_window)))
@@ -680,6 +691,7 @@ class BaseStrategy(ABC):
             sell_amount = float(liq.get("suggestion", sell_amount))
             if await self._execute_partial_sell(position, current_price, sell_amount, "TP1_time_force"):
                 state["step"] = 1
+                state["last_tp_ts"] = time.time()
                 self._ratchet_sl(position, state, 0)
                 return True
             return False
@@ -701,11 +713,13 @@ class BaseStrategy(ABC):
             ok2 = await self._execute_partial_sell(position, current_price, rem, f"TP{step_idx+1}_b") if ok1 else False
             if ok1 and ok2:
                 state["step"] = step_idx + 1
+                state["last_tp_ts"] = time.time()
                 self._ratchet_sl(position, state, step_idx)
                 return True
             if ok1 and not ok2:
                 # Avoid being left de-risked without the corresponding SL ratchet.
                 state["step"] = step_idx + 1
+                state["last_tp_ts"] = time.time()
                 self._ratchet_sl(position, state, step_idx)
                 self.log(
                     f"TP{step_idx+1} split partially filled; ladder advanced and SL ratcheted",
@@ -715,6 +729,7 @@ class BaseStrategy(ABC):
             return False
         if await self._execute_partial_sell(position, current_price, sell_amount, f"TP{step_idx+1}"):
             state["step"] = step_idx + 1
+            state["last_tp_ts"] = time.time()
             self._ratchet_sl(position, state, step_idx)
             return True
         return False
@@ -783,7 +798,9 @@ class BaseStrategy(ABC):
                 if self.config.partial_tp_enabled else None
             )
             if partial_tp_state is not None and bool(partial_tp_state.get("sl_hold_to_expiry", False)):
-                continue
+                # Keep managing this as a normal position so SL can still fire.
+                # Previously this state suppressed all exits for the remainder.
+                partial_tp_state = None
             current_price = prices.get(position.side, 0.0)
             if current_price <= 0:
                 continue
@@ -837,6 +854,17 @@ class BaseStrategy(ABC):
 
             if exit_type is None:
                 continue
+
+            # Debounce repeated TP/SL triggers for the same position when
+            # prices hover around a threshold or a prior exit just failed.
+            now = time.time()
+            last_exit_attempt = self._last_exit_attempt_at.get(position.id, 0.0)
+            if (
+                self.config.exit_retrigger_cooldown_seconds > 0
+                and (now - last_exit_attempt) < self.config.exit_retrigger_cooldown_seconds
+            ):
+                continue
+            self._last_exit_attempt_at[position.id] = now
 
             if exit_type == "take_profit":
                 self.log(
@@ -987,6 +1015,7 @@ class BaseStrategy(ABC):
         on Polymarket and will settle externally.
         """
         self._partial_tp_state.pop(position.id, None)
+        self._last_exit_attempt_at.pop(position.id, None)
         self.positions.close_position(position.id, realized_pnl=0.0)
         self.log(
             f"Resolution rollover: detached local {position.side.upper()} position ({reason})",
@@ -1010,6 +1039,7 @@ class BaseStrategy(ABC):
         shares = max(0.0, int(shares * 100) / 100.0)
         entry_notional = position.entry_price * shares
         self._partial_tp_state.pop(position.id, None)
+        self._last_exit_attempt_at.pop(position.id, None)
         self.positions.close_position(position.id, realized_pnl=0.0)
         self.log(
             f"Wallet sync: external sell closed {position.side.upper()} position "
@@ -1196,6 +1226,7 @@ class BaseStrategy(ABC):
                 entry_notional = position.entry_price * position.size
                 self._partial_tp_state[position.id] = {
                     "step": 0,
+                    "last_tp_ts": 0.0,
                     "initial_size": float(position.size),
                     "realized_proceeds": 0.0,
                     "profile": self._partial_tp_profile(position.entry_price),
@@ -1249,6 +1280,9 @@ class BaseStrategy(ABC):
         Returns:
             True if fully sold
         """
+        reason_lc = (exit_reason or "").lower()
+        force_stop_loss_exit = "stop_loss" in reason_lc
+
         # SELL FOK maker amount supports max 2 decimals in shares.
         # Round DOWN to avoid over-selling.
         sell_size = int(position.size * 100) / 100.0
@@ -1357,11 +1391,18 @@ class BaseStrategy(ABC):
                 if best_bid > 0 and ratchet_max_slippage > 0:
                     slip = max(0.0, (ratchet_anchor - best_bid) / ratchet_anchor)
                     if slip > ratchet_max_slippage:
-                        self._mark_partial_tp_hold_to_expiry(
-                            position,
-                            f"ratchet_slippage_{slip:.1%}_over_{ratchet_max_slippage:.1%}",
-                        )
-                        return False
+                        if force_stop_loss_exit:
+                            self.log(
+                                f"STOP LOSS override: slippage {slip:.1%} exceeds "
+                                f"cap {ratchet_max_slippage:.1%}; forcing exit",
+                                "warning",
+                            )
+                        else:
+                            self._mark_partial_tp_hold_to_expiry(
+                                position,
+                                f"ratchet_slippage_{slip:.1%}_over_{ratchet_max_slippage:.1%}",
+                            )
+                            return False
                 if best_bid > 0:
                     base_price = max(0.01, min(ratchet_anchor, best_bid))
                 else:
@@ -1375,7 +1416,12 @@ class BaseStrategy(ABC):
                 initial_sell_price = sell_price
             step = max(0.0, float(self.config.sell_retry_price_step))
             sell_price = max(0.01, initial_sell_price - (attempt * step))
-            if ratchet_anchor > 0 and ratchet_max_slippage > 0 and sell_price < ratchet_floor_price:
+            if (
+                (not force_stop_loss_exit)
+                and ratchet_anchor > 0
+                and ratchet_max_slippage > 0
+                and sell_price < ratchet_floor_price
+            ):
                 slip = max(0.0, (ratchet_anchor - sell_price) / ratchet_anchor)
                 self._mark_partial_tp_hold_to_expiry(
                     position,
@@ -1384,6 +1430,8 @@ class BaseStrategy(ABC):
                 return False
             realized_slippage = max(0.0, initial_sell_price - sell_price)
             if (
+                (not force_stop_loss_exit)
+                and
                 self.config.sell_retry_max_slippage > 0
                 and realized_slippage > self.config.sell_retry_max_slippage
             ):
@@ -1436,6 +1484,7 @@ class BaseStrategy(ABC):
                     }
                 )
                 self._partial_tp_state.pop(position.id, None)
+                self._last_exit_attempt_at.pop(position.id, None)
                 self.positions.close_position(position.id, realized_pnl=realized_pnl)
                 # Refresh both caches so next buy sees updated USDC balance
                 await self.bot.refresh_balances(token_id=position.token_id)
