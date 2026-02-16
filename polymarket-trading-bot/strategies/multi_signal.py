@@ -138,7 +138,7 @@ class MultiSignalConfig(StrategyConfig):
     dynamic_threshold_base: float = 0.35
     dynamic_threshold_vol_adjustment: float = 0.15
     dynamic_threshold_enabled: bool = True
-    dynamic_threshold_max: float = 0.45
+    dynamic_threshold_max: float = 0.40
     dynamic_threshold_warmup_samples: int = 60
     threshold_volatility_window: float = 45.0
     volatility_history_size: int = 180
@@ -230,6 +230,8 @@ class MultiSignalStrategy(BaseStrategy):
         self._last_signal_state_lines: List[str] = []
         self._last_raw_signal_state: Dict[str, float] = {}
         self._last_conflict_reason: str = ""
+        self._screen_initialized: bool = False
+        self._last_render_line_count: int = 0
         self._last_entry_gate: Dict[str, object] = {
             "ts": 0.0,
             "side": "",
@@ -359,12 +361,7 @@ class MultiSignalStrategy(BaseStrategy):
                     self._last_signal_time = now
                     self._total_signals_fired += 1
         else:
-            # Keep a human-readable trace in the strategy log buffer.
-            self.log(
-                f"[ENTRY BLOCKED] side={best_side.upper()} "
-                f"composite={best_score:.3f} threshold={min_score:.3f}",
-                "info",
-            )
+            return
 
     # ------------------------------------------------------------------
     # Signal detectors
@@ -726,6 +723,37 @@ class MultiSignalStrategy(BaseStrategy):
             "time_remaining_s": time_remaining,
             "current_prob": current_prob,
             "vpin_proxy": vpin_proxy,
+        }
+
+    def _get_trade_context(self) -> Dict[str, object]:
+        """
+        Attach strategy-specific context to telemetry events.
+        """
+        signal_map: Dict[str, float] = {}
+        for sig in self._last_signals:
+            key = f"{sig.source}_{sig.side}"
+            signal_map[key] = max(signal_map.get(key, 0.0), sig.score)
+
+        gate = {
+            "side": str(self._last_entry_gate.get("side", "")),
+            "composite": float(self._last_entry_gate.get("composite", 0.0)),
+            "threshold": float(self._last_entry_gate.get("threshold", 0.0)),
+            "pass": bool(self._last_entry_gate.get("pass", False)),
+        }
+
+        return {
+            "signals": signal_map,
+            "raw": dict(self._last_raw_signal_state),
+            "entry_gate": gate,
+            "conflict": self._last_conflict_reason,
+            "detectors_enabled": {
+                "flash_crash": self.signal_config.flash_crash_enabled,
+                "momentum": self.signal_config.momentum_enabled,
+                "imbalance": self.signal_config.imbalance_enabled,
+                "time_decay": self.signal_config.time_decay_enabled,
+                "spot_divergence": self.signal_config.spot_divergence_enabled,
+                "flow_toxicity": self.signal_config.flow_toxicity_enabled,
+            },
         }
 
     def _source_weight(self, source: str) -> float:
@@ -1125,11 +1153,6 @@ class MultiSignalStrategy(BaseStrategy):
         gate_side = str(self._last_entry_gate.get("side", ""))
         gate_pass = bool(self._last_entry_gate.get("pass", False))
         if (not gate_pass) or gate_side != side or (time.time() - gate_ts) > 2.0:
-            self.log(
-                f"[ENTRY BLOCKED] stale/failed gate side={side.upper()} "
-                f"pass={gate_pass} gate_side={gate_side.upper() if gate_side else '?'}",
-                "warning",
-            )
             return False
 
         old_size = self.config.size
@@ -1151,11 +1174,6 @@ class MultiSignalStrategy(BaseStrategy):
             "threshold": threshold,
             "pass": passed,
         }
-        self.log(
-            f"[ENTRY CHECK] side={side.upper()} composite={composite:.3f} "
-            f"threshold={threshold:.3f} pass={passed}",
-            "info",
-        )
         return passed
 
     def _can_enter_window(self, now: float, signal_score: float) -> bool:
@@ -1288,14 +1306,25 @@ class MultiSignalStrategy(BaseStrategy):
             return True
 
         total_secs = mins * 60 + secs
-        return total_secs < self.signal_config.min_time_remaining
+        # Never open a new position inside the late "hold-to-expiry" zone.
+        # This prevents late entries from being immediately mercy-stopped.
+        min_entry_secs = max(
+            int(self.signal_config.min_time_remaining),
+            int(self._late_phase_cutoff_secs()),
+        )
+        return total_secs < min_entry_secs
 
-    async def execute_sell(self, position, current_price: float) -> bool:
+    async def execute_sell(
+        self,
+        position,
+        current_price: float,
+        exit_reason: Optional[str] = None,
+    ) -> bool:
         """
         Extend base sell to track re-entry budget state.
         """
         pnl = position.get_pnl(current_price)
-        success = await super().execute_sell(position, current_price)
+        success = await super().execute_sell(position, current_price, exit_reason=exit_reason)
         if success:
             slug = self._current_slug()
             if slug:
@@ -1328,6 +1357,8 @@ class MultiSignalStrategy(BaseStrategy):
         self._last_signal_state_lines = []
         self._last_raw_signal_state = {}
         self._last_conflict_reason = ""
+        self._screen_initialized = False
+        self._last_render_line_count = 0
         self._last_entry_gate = {
             "ts": 0.0,
             "side": "",
@@ -1530,6 +1561,13 @@ class MultiSignalStrategy(BaseStrategy):
             for msg in self._log_buffer.get_messages():
                 lines.append(f"  {msg}")
 
-        # Render
-        output = "\033[H\033[J" + "\n".join(lines)
-        print(output, flush=True)
+        # Render in place. Clear once, then keep redrawing from the top.
+        # This is much less visually noisy than clearing the full screen every frame.
+        pad_lines = max(0, self._last_render_line_count - len(lines))
+        if pad_lines:
+            lines.extend([""] * pad_lines)
+        self._last_render_line_count = len(lines)
+        prefix = "\033[2J\033[H" if not self._screen_initialized else "\033[H"
+        self._screen_initialized = True
+        output = prefix + "\n".join(lines)
+        print(output, end="", flush=True)

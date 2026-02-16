@@ -30,6 +30,7 @@ from lib.console import LogBuffer, log
 from lib.market_manager import MarketManager, MarketInfo
 from lib.price_tracker import PriceTracker
 from lib.position_manager import PositionManager, Position
+from lib.trade_telemetry import TradeTelemetry
 from src.bot import TradingBot
 from src.websocket_client import OrderbookSnapshot
 
@@ -45,6 +46,8 @@ class StrategyConfig:
     stop_loss: float = 0.05
     early_stop_loss: float = 0.30   # Wider SL during the first minute of the market
     early_sl_window: int = 60       # Seconds from market start for the wider SL
+    use_time_phase_exits: bool = True
+    min_hold_before_exit_seconds: float = 8.0
 
     # Market settings
     market_duration: int = 15  # Market duration in minutes (5 or 15)
@@ -57,8 +60,13 @@ class StrategyConfig:
 
     # Display settings
     update_interval: float = 0.1
+    render_interval: float = 0.25  # seconds between TUI redraws
     order_refresh_interval: float = 30.0  # Seconds between order refreshes
     wallet_sync_interval: float = 3.0     # Seconds between wallet/position reconciliation
+
+    # Telemetry / analytics
+    trade_telemetry_enabled: bool = True
+    trade_telemetry_dir: str = "logs/trades"
 
 
 class BaseStrategy(ABC):
@@ -101,6 +109,13 @@ class BaseStrategy(ABC):
             stop_loss=config.stop_loss,
             max_positions=config.max_positions,
         )
+        self.telemetry = TradeTelemetry(
+            enabled=config.trade_telemetry_enabled,
+            base_dir=config.trade_telemetry_dir,
+            strategy_name=self.__class__.__name__,
+            coin=config.coin,
+            market_duration_min=config.market_duration,
+        )
 
         # State
         self.running = False
@@ -108,6 +123,7 @@ class BaseStrategy(ABC):
 
         # Logging
         self._log_buffer = LogBuffer(max_size=5)
+        self._last_render_time: float = 0.0
 
         # Open orders cache (refreshed in background)
         self._cached_orders: List[dict] = []
@@ -195,6 +211,34 @@ class BaseStrategy(ABC):
             self._log_buffer.add(msg, level)
         else:
             log(msg, level)
+
+    def _get_trade_context(self) -> Dict[str, object]:
+        """
+        Strategy-specific telemetry context hook.
+
+        Subclasses can override to attach signal state, raw features, etc.
+        """
+        return {}
+
+    def _time_remaining_secs(self) -> Optional[int]:
+        market = self.current_market
+        if not market:
+            return None
+        mins, secs = market.get_countdown()
+        if mins < 0:
+            return None
+        return mins * 60 + secs
+
+    def _market_slug(self) -> str:
+        market = self.current_market
+        return market.slug if market else ""
+
+    def _telemetry_log(self, payload: Dict[str, object]) -> None:
+        try:
+            self.telemetry.log_event(payload)
+        except Exception:
+            # Telemetry must never break live trading.
+            pass
 
     async def start(self) -> bool:
         """
@@ -301,8 +345,14 @@ class BaseStrategy(ABC):
                 # Refresh orders in background (fire-and-forget)
                 self._maybe_refresh_orders()
 
-                # Update display
-                self.render_status(prices)
+                # Update display at a slower cadence to reduce TUI flicker.
+                now = time.time()
+                if (
+                    self.config.render_interval <= 0
+                    or (now - self._last_render_time) >= self.config.render_interval
+                ):
+                    self.render_status(prices)
+                    self._last_render_time = now
 
                 await asyncio.sleep(self.config.update_interval)
 
@@ -363,6 +413,49 @@ class BaseStrategy(ABC):
         # elapsed could be negative if clock skew; clamp to 0
         return max(0.0, elapsed)
 
+    def _get_time_remaining_secs(self) -> Optional[int]:
+        """Return seconds remaining in current market, or None."""
+        market = self.current_market
+        if not market:
+            return None
+        mins, secs = market.get_countdown()
+        if mins < 0:
+            return None
+        return max(0, mins * 60 + secs)
+
+    def _phase_exit_params(self, time_remaining_secs: int) -> tuple[Optional[float], float, bool, str]:
+        """
+        Return (tp_delta, sl_delta, hold_to_expiry, phase_label).
+
+        Percent values are deltas on entry price (e.g. 0.30 => +30% TP).
+        """
+        total = max(1, self.config.market_duration * 60)
+
+        # 5m profile
+        if total <= 300:
+            if time_remaining_secs > 180:
+                return (0.25, 0.15, False, "early")
+            if time_remaining_secs > 60:
+                return (0.35, 0.12, False, "mid")
+            return (None, 0.25, True, "late")
+
+        # 15m (and default longer-window fallback) profile
+        if time_remaining_secs > 600:
+            return (0.30, 0.20, False, "early")
+        if time_remaining_secs > 180:
+            return (0.40, 0.15, False, "mid")
+        return (None, 0.30, True, "late")
+
+    def _late_phase_cutoff_secs(self) -> int:
+        """
+        Return late-phase cutoff where binary positions are usually held.
+
+        For 5m markets this starts in the final 60s.
+        For 15m markets this starts in the final 180s (3m).
+        """
+        total = max(1, self.config.market_duration * 60)
+        return 60 if total <= 300 else 180
+
     def _update_dynamic_stop_loss(self) -> None:
         """
         Dynamically adjust stop-loss on open positions based on market age.
@@ -387,25 +480,74 @@ class BaseStrategy(ABC):
 
     async def _check_exits(self, prices: Dict[str, float]) -> None:
         """Check and execute exits for all positions."""
-        # Adjust SL width based on how far into the market we are
-        self._update_dynamic_stop_loss()
+        if not self.config.use_time_phase_exits:
+            # Legacy behavior
+            self._update_dynamic_stop_loss()
+            exits = self.positions.check_all_exits(prices)
+            for position, exit_type, _pnl in exits:
+                if exit_type == "take_profit":
+                    self.log(
+                        f"TAKE PROFIT: {position.side.upper()} exiting",
+                        "success"
+                    )
+                elif exit_type == "stop_loss":
+                    self.log(
+                        f"STOP LOSS: {position.side.upper()} exiting",
+                        "warning"
+                    )
+                await self.execute_sell(
+                    position,
+                    prices.get(position.side, 0),
+                    exit_reason=exit_type,
+                )
+            return
 
-        exits = self.positions.check_all_exits(prices)
+        time_remaining = self._get_time_remaining_secs()
+        if time_remaining is None:
+            return
 
-        for position, exit_type, pnl in exits:
+        for position in self.positions.get_all_positions():
+            current_price = prices.get(position.side, 0.0)
+            if current_price <= 0:
+                continue
+            if position.get_hold_time() < self.config.min_hold_before_exit_seconds:
+                continue
+
+            tp_delta, sl_delta, hold_to_expiry, phase = self._phase_exit_params(time_remaining)
+            position.stop_loss_delta = sl_delta
+            if tp_delta is not None:
+                position.take_profit_delta = tp_delta
+
+            pnl_pct = 0.0
+            if position.entry_price > 0:
+                pnl_pct = (current_price - position.entry_price) / position.entry_price
+
+            exit_type: Optional[str] = None
+            if hold_to_expiry:
+                # Late phase: hold by default, only mercy-stop severe losers.
+                if pnl_pct <= -sl_delta:
+                    exit_type = "stop_loss"
+            else:
+                if tp_delta is not None and pnl_pct >= tp_delta:
+                    exit_type = "take_profit"
+                elif pnl_pct <= -sl_delta:
+                    exit_type = "stop_loss"
+
+            if exit_type is None:
+                continue
+
             if exit_type == "take_profit":
                 self.log(
-                    f"TAKE PROFIT: {position.side.upper()} PnL: +${pnl:.2f}",
-                    "success"
+                    f"TAKE PROFIT ({phase}): {position.side.upper()} exiting",
+                    "success",
                 )
-            elif exit_type == "stop_loss":
+            else:
                 self.log(
-                    f"STOP LOSS: {position.side.upper()} PnL: ${pnl:.2f}",
-                    "warning"
+                    f"STOP LOSS ({phase}): {position.side.upper()} exiting",
+                    "warning",
                 )
 
-            # Execute sell
-            await self.execute_sell(position, prices.get(position.side, 0))
+            await self.execute_sell(position, current_price, exit_reason=exit_type)
 
     async def _sync_positions_with_wallet(self, prices: Dict[str, float]) -> None:
         """
@@ -445,16 +587,13 @@ class BaseStrategy(ABC):
                 continue
 
             if wallet_size < 0.01:
-                self.positions.close_position(pos.id, realized_pnl=0.0)
-                self.log(
-                    f"Wallet sync: external sell closed {pos.side.upper()} position "
-                    f"(tracked={tracked_size:.2f}, wallet={wallet_size:.2f})",
-                    "warning",
+                current_price = prices.get(pos.side, 0.0)
+                self._close_position_as_external_exit(
+                    pos,
+                    current_price=current_price,
+                    tracked_size=tracked_size,
+                    reason=f"wallet sync (tracked={tracked_size:.2f}, wallet={wallet_size:.2f})",
                 )
-                market = self.current_market
-                current_slug = market.slug if market else ""
-                if current_slug:
-                    self._completed_market_slugs.add(current_slug)
                 continue
 
             pos.size = wallet_size
@@ -527,6 +666,43 @@ class BaseStrategy(ABC):
         if balance_shares is not None:
             return max(0.0, balance_shares)
         return None
+
+    def _close_position_as_external_exit(
+        self,
+        position: Position,
+        current_price: float,
+        tracked_size: Optional[float] = None,
+        reason: str = "external sell detected",
+    ) -> None:
+        """
+        Close in-memory position when wallet indicates it was sold externally.
+
+        Realized PnL is recorded as 0.0 because external execution price is
+        unknown to the strategy process.
+        """
+        shares = tracked_size if tracked_size is not None else max(0.0, position.size)
+        shares = max(0.0, int(shares * 100) / 100.0)
+        entry_notional = position.entry_price * shares
+        self.positions.close_position(position.id, realized_pnl=0.0)
+        self.log(
+            f"Wallet sync: external sell closed {position.side.upper()} position "
+            f"({reason})",
+            "warning",
+        )
+        self._telemetry_log(
+            {
+                "event_type": "exit",
+                "size": round(entry_notional, 6),
+                "entry_price": position.entry_price,
+                "exit_price": current_price if current_price > 0 else "",
+                "size_shares": shares,
+                "hold_seconds": round(position.get_hold_time(), 3),
+            }
+        )
+        market = self.current_market
+        current_slug = market.slug if market else ""
+        if current_slug:
+            self._completed_market_slugs.add(current_slug)
 
     async def execute_buy(self, side: str, current_price: float) -> bool:
         """
@@ -674,13 +850,25 @@ class BaseStrategy(ABC):
             self._balance_block_until = 0.0  # clear cooldown on success
             self._last_blocked_buy_slug = None
             self.log(f"Order filled: {result.order_id} size={tracked_size:.2f}", "success")
-            self.positions.open_position(
+            position = self.positions.open_position(
                 side=side,
                 token_id=token_id,
                 entry_price=current_price,
                 size=tracked_size,
                 order_id=result.order_id,
             )
+            if position:
+                entry_notional = position.entry_price * position.size
+                self._telemetry_log(
+                    {
+                        "event_type": "entry",
+                        "size": round(entry_notional, 6),
+                        "entry_price": position.entry_price,
+                        "exit_price": "",
+                        "size_shares": position.size,
+                        "hold_seconds": 0.0,
+                    }
+                )
             return True
         else:
             msg = (result.message or "").lower()
@@ -695,7 +883,12 @@ class BaseStrategy(ABC):
                 self.log(f"Order failed: {result.message}", "error")
             return False
 
-    async def execute_sell(self, position: Position, current_price: float) -> bool:
+    async def execute_sell(
+        self,
+        position: Position,
+        current_price: float,
+        exit_reason: Optional[str] = None,
+    ) -> bool:
         """
         Execute sell order to close position.
 
@@ -709,8 +902,6 @@ class BaseStrategy(ABC):
         Returns:
             True if fully sold
         """
-        pnl = position.get_pnl(current_price)
-
         # SELL FOK maker amount supports max 2 decimals in shares.
         # Round DOWN to avoid over-selling.
         sell_size = int(position.size * 100) / 100.0
@@ -730,6 +921,14 @@ class BaseStrategy(ABC):
             )
             await asyncio.sleep(1.0)
             tradable = await self._get_tradable_shares(position.token_id)
+            if tradable is not None and tradable < 0.01:
+                # Position appears already sold outside this process.
+                self._close_position_as_external_exit(
+                    position,
+                    current_price=current_price,
+                    reason="sell requested but wallet has zero shares",
+                )
+                return True
 
         if tradable is not None and tradable >= 0.01 and tradable < sell_size:
             old_size = sell_size
@@ -797,6 +996,9 @@ class BaseStrategy(ABC):
             else:
                 sell_price = base_price
             sell_price = max(0.01, sell_price - (attempt * 0.02))
+            # Realized PnL should be based on the actual submitted exit price/size,
+            # not on pre-trade mark price snapshots.
+            realized_pnl = (sell_price - position.entry_price) * sell_size
 
             result = await self.bot.place_order(
                 token_id=position.token_id,
@@ -807,8 +1009,19 @@ class BaseStrategy(ABC):
             )
 
             if result.success:
-                self.log(f"Sell order: full exit PnL: ${pnl:+.2f}", "success")
-                self.positions.close_position(position.id, realized_pnl=pnl)
+                self.log(f"Sell order: full exit PnL: ${realized_pnl:+.2f}", "success")
+                entry_notional = position.entry_price * position.size
+                self._telemetry_log(
+                    {
+                        "event_type": "exit",
+                        "size": round(entry_notional, 6),
+                        "entry_price": position.entry_price,
+                        "exit_price": sell_price,
+                        "size_shares": sell_size,
+                        "hold_seconds": round(position.get_hold_time(), 3),
+                    }
+                )
+                self.positions.close_position(position.id, realized_pnl=realized_pnl)
                 # Refresh both caches so next buy sees updated USDC balance
                 await self.bot.refresh_balances(token_id=position.token_id)
                 market = self.current_market
@@ -820,6 +1033,20 @@ class BaseStrategy(ABC):
             msg = (result.message or "").lower()
 
             if "not enough balance" in msg:
+                # Re-check tradable shares after rejection. If wallet now shows
+                # no shares, treat this as an external/manual close and clear
+                # local state to avoid repeated failing sell attempts.
+                await self.bot.update_balance_allowance(
+                    "CONDITIONAL", position.token_id
+                )
+                post_err_tradable = await self._get_tradable_shares(position.token_id)
+                if post_err_tradable is not None and post_err_tradable < 0.01:
+                    self._close_position_as_external_exit(
+                        position,
+                        current_price=current_price,
+                        reason="sell rejected and wallet shows zero shares",
+                    )
+                    return True
                 if attempt < max_attempts - 1:
                     # Progressive waits: 5, 10, 15, 20, 25s.
                     wait = 5.0 + attempt * 5.0

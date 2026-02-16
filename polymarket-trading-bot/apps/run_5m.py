@@ -14,7 +14,7 @@ Configuration rationale (5-minute markets):
   - Tight TP (+$0.05) and SL (-$0.03) to lock in quick scalps
   - 2 max positions (can hold both UP and DOWN simultaneously)
   - Faster market check (15s) since 5m windows rotate quickly
-  - Won't enter with less than 30s remaining (safety)
+  - Won't enter with less than 60s remaining (late hold-to-expiry zone)
 
 Usage:
     python apps/run_5m.py
@@ -33,6 +33,7 @@ from pathlib import Path
 # Suppress noisy logs
 logging.getLogger("src.websocket_client").setLevel(logging.WARNING)
 logging.getLogger("src.bot").setLevel(logging.WARNING)
+logging.getLogger("src.client").setLevel(logging.WARNING)
 
 # Auto-load .env file
 from dotenv import load_dotenv
@@ -98,7 +99,7 @@ DEFAULTS_5M = dict(
     dynamic_threshold_base=0.35,
     dynamic_threshold_vol_adjustment=0.10,
     signal_cooldown=8.0,
-    min_time_remaining=30,
+    min_time_remaining=60,
 )
 
 

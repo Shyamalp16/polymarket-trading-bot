@@ -15,7 +15,7 @@ Configuration rationale (15-minute markets):
   - TP (+$0.10) and SL (-$0.05) matching the standard risk/reward profile
   - 2 max positions (can hold both UP and DOWN simultaneously)
   - Standard market check (30s) since windows are longer
-  - Won't enter with less than 60s remaining (safety)
+  - Won't enter with less than 180s remaining (late hold-to-expiry zone)
   - Higher min signal score (0.7) for more selective entries
 
 Usage:
@@ -35,6 +35,7 @@ from pathlib import Path
 # Suppress noisy logs
 logging.getLogger("src.websocket_client").setLevel(logging.WARNING)
 logging.getLogger("src.bot").setLevel(logging.WARNING)
+logging.getLogger("src.client").setLevel(logging.WARNING)
 
 # Auto-load .env file
 from dotenv import load_dotenv
@@ -98,7 +99,7 @@ DEFAULTS_15M = dict(
     dynamic_threshold_base=0.35,
     dynamic_threshold_vol_adjustment=0.10,
     signal_cooldown=12.0,
-    min_time_remaining=60,
+    min_time_remaining=180,
 )
 
 

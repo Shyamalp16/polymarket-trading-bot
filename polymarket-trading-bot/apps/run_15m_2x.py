@@ -24,7 +24,7 @@ Configuration rationale:
   - Lower min signal score (0.5) since each signal is already high-conviction
   - Longer cooldown (15s) for patience between entries
   - Max 2 positions (can hold UP + DOWN if both crash)
-  - Safety cutoff at 45s (can still enter late for time decay plays)
+  - Safety cutoff at 180s (avoid new entries in late hold-to-expiry zone)
 
 Expected performance (per 10 trades):
   - Win rate: ~30%
@@ -50,6 +50,7 @@ from pathlib import Path
 # Suppress noisy logs
 logging.getLogger("src.websocket_client").setLevel(logging.WARNING)
 logging.getLogger("src.bot").setLevel(logging.WARNING)
+logging.getLogger("src.client").setLevel(logging.WARNING)
 
 # Auto-load .env file
 from dotenv import load_dotenv
@@ -113,7 +114,7 @@ DEFAULTS_2X = dict(
     # Signal combination -- lower score since only 2 high-conviction signals
     min_signal_score=0.5,
     signal_cooldown=15.0,       # Patient between entries
-    min_time_remaining=45,      # Can still enter late for decay plays
+    min_time_remaining=180,     # Avoid late-phase entries; hold existing positions instead
 )
 
 
