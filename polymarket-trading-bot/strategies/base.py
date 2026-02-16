@@ -48,7 +48,7 @@ class StrategyConfig:
     early_stop_loss: float = 0.30   # Wider SL during the first minute of the market
     early_sl_window: int = 60       # Seconds from market start for the wider SL
     use_time_phase_exits: bool = True
-    min_hold_before_exit_seconds: float = 30.0
+    min_hold_before_exit_seconds: float = 15.0
     partial_tp_enabled: bool = True
     partial_tp_time_force_enabled: bool = True
     partial_tp_late_hold_threshold: float = 0.15
@@ -513,6 +513,8 @@ class BaseStrategy(ABC):
             "realized_proceeds": 0.0,
             "profile": self._partial_tp_profile(position.entry_price),
             "ratchet_sl": initial_sl,
+            "sl_hold_to_expiry": False,
+            "sl_hold_reason": "",
         }
         self._partial_tp_state[position.id] = state
         return state
@@ -608,6 +610,19 @@ class BaseStrategy(ABC):
                 "info",
             )
 
+    def _mark_partial_tp_hold_to_expiry(self, position: Position, reason: str) -> None:
+        """Disable further exits for a partial-TP position and hold to expiry."""
+        state = self._partial_tp_state.get(position.id)
+        if state is None:
+            return
+        if not bool(state.get("sl_hold_to_expiry", False)):
+            state["sl_hold_to_expiry"] = True
+            state["sl_hold_reason"] = reason
+            self.log(
+                f"SL fallback: HOLD_TO_EXPIRY for {position.side.upper()} ({reason})",
+                "warning",
+            )
+
     async def _maybe_partial_tp(
         self,
         position: Position,
@@ -669,6 +684,15 @@ class BaseStrategy(ABC):
             if ok1 and ok2:
                 state["step"] = step_idx + 1
                 self._ratchet_sl(position, state, step_idx)
+                return True
+            if ok1 and not ok2:
+                # Avoid being left de-risked without the corresponding SL ratchet.
+                state["step"] = step_idx + 1
+                self._ratchet_sl(position, state, step_idx)
+                self.log(
+                    f"TP{step_idx+1} split partially filled; ladder advanced and SL ratcheted",
+                    "warning",
+                )
                 return True
             return False
         if await self._execute_partial_sell(position, current_price, sell_amount, f"TP{step_idx+1}"):
@@ -736,6 +760,12 @@ class BaseStrategy(ABC):
             if current_slug and getattr(position, "market_slug", "") and position.market_slug != current_slug:
                 # Do not evaluate exits for an old market against the new market's prices.
                 continue
+            partial_tp_state = (
+                self._partial_tp_state.get(position.id)
+                if self.config.partial_tp_enabled else None
+            )
+            if partial_tp_state is not None and bool(partial_tp_state.get("sl_hold_to_expiry", False)):
+                continue
             current_price = prices.get(position.side, 0.0)
             if current_price <= 0:
                 continue
@@ -747,11 +777,6 @@ class BaseStrategy(ABC):
             # When partial TP is managing this position, suppress the
             # phase-based full TP so the remainder rides to expiry.
             # The ratcheted SL replaces the normal phase SL.
-            partial_tp_state = (
-                self._partial_tp_state.get(position.id)
-                if self.config.partial_tp_enabled else None
-            )
-
             tp_delta, sl_delta, hold_to_expiry, phase = self._phase_exit_params(time_remaining)
 
             if partial_tp_state is not None:
@@ -774,12 +799,14 @@ class BaseStrategy(ABC):
                 pnl_pct = (current_price - position.entry_price) / position.entry_price
 
             exit_type: Optional[str] = None
+            sl_anchor_price: Optional[float] = None
             if partial_tp_state is not None:
                 # Partial TP ladder owns take-profit. Only the ratcheted
                 # stop-loss can close the remaining position.
                 ratchet_sl = float(partial_tp_state.get("ratchet_sl", 0.0))
                 if ratchet_sl > 0 and current_price <= ratchet_sl:
                     exit_type = "stop_loss"
+                    sl_anchor_price = ratchet_sl
             elif hold_to_expiry:
                 # Late phase: hold by default, only mercy-stop severe losers.
                 if pnl_pct <= -sl_delta:
@@ -804,7 +831,12 @@ class BaseStrategy(ABC):
                     "warning",
                 )
 
-            await self.execute_sell(position, current_price, exit_reason=exit_type)
+            await self.execute_sell(
+                position,
+                current_price,
+                exit_reason=exit_type,
+                sl_anchor_price=sl_anchor_price,
+            )
 
     async def _sync_positions_with_wallet(self, prices: Dict[str, float]) -> None:
         """
@@ -1134,6 +1166,8 @@ class BaseStrategy(ABC):
                     "realized_proceeds": 0.0,
                     "profile": self._partial_tp_profile(position.entry_price),
                     "ratchet_sl": position.entry_price * (1 - self.config.stop_loss),
+                    "sl_hold_to_expiry": False,
+                    "sl_hold_reason": "",
                 }
                 self._telemetry_log(
                     {
@@ -1164,6 +1198,7 @@ class BaseStrategy(ABC):
         position: Position,
         current_price: float,
         exit_reason: Optional[str] = None,
+        sl_anchor_price: Optional[float] = None,
     ) -> bool:
         """
         Execute sell order to close position.
@@ -1174,6 +1209,8 @@ class BaseStrategy(ABC):
         Args:
             position: Position to close
             current_price: Current price
+            exit_reason: Exit label for logs/telemetry
+            sl_anchor_price: Optional stop anchor for ratcheted SL exits
 
         Returns:
             True if fully sold
@@ -1222,6 +1259,21 @@ class BaseStrategy(ABC):
         # order attempt.
         max_attempts = 6
         initial_sell_price = 0.0
+        ratchet_anchor = (
+            max(0.01, float(sl_anchor_price))
+            if sl_anchor_price is not None and sl_anchor_price > 0
+            else 0.0
+        )
+        ratchet_max_slippage = (
+            max(0.0, float(self.config.sell_retry_max_slippage))
+            if ratchet_anchor > 0
+            else 0.0
+        )
+        ratchet_floor_price = (
+            max(0.01, ratchet_anchor * (1.0 - ratchet_max_slippage))
+            if ratchet_anchor > 0 and ratchet_max_slippage > 0
+            else 0.01
+        )
         for attempt in range(max_attempts):
             # --- Phase 1: wait until the CLOB cache shows a balance ---
             # On the first attempt we poll aggressively (up to 8×3s = 24s)
@@ -1265,17 +1317,37 @@ class BaseStrategy(ABC):
                 )
 
             # --- Phase 2: submit the sell order ---
-            # Price: start at best bid or mid-5%, widen 2c per retry.
+            # Price: use ratchet anchor for SL exits, otherwise best-bid / mid fallback.
             best_bid = self.market.get_best_bid(position.side)
-            base_price = max(current_price - 0.05, 0.01)
-            if best_bid > 0:
-                sell_price = max(0.01, min(base_price, best_bid))
+            if ratchet_anchor > 0:
+                if best_bid > 0 and ratchet_max_slippage > 0:
+                    slip = max(0.0, (ratchet_anchor - best_bid) / ratchet_anchor)
+                    if slip > ratchet_max_slippage:
+                        self._mark_partial_tp_hold_to_expiry(
+                            position,
+                            f"ratchet_slippage_{slip:.1%}_over_{ratchet_max_slippage:.1%}",
+                        )
+                        return False
+                if best_bid > 0:
+                    base_price = max(0.01, min(ratchet_anchor, best_bid))
+                else:
+                    base_price = ratchet_anchor
             else:
-                sell_price = base_price
+                base_price = max(current_price - 0.05, 0.01)
+                if best_bid > 0:
+                    base_price = max(0.01, min(base_price, best_bid))
+            sell_price = base_price
             if attempt == 0:
                 initial_sell_price = sell_price
             step = max(0.0, float(self.config.sell_retry_price_step))
             sell_price = max(0.01, initial_sell_price - (attempt * step))
+            if ratchet_anchor > 0 and ratchet_max_slippage > 0 and sell_price < ratchet_floor_price:
+                slip = max(0.0, (ratchet_anchor - sell_price) / ratchet_anchor)
+                self._mark_partial_tp_hold_to_expiry(
+                    position,
+                    f"ratchet_slippage_{slip:.1%}_over_{ratchet_max_slippage:.1%}",
+                )
+                return False
             realized_slippage = max(0.0, initial_sell_price - sell_price)
             if (
                 self.config.sell_retry_max_slippage > 0
@@ -1286,6 +1358,11 @@ class BaseStrategy(ABC):
                     f"({realized_slippage:.3f} > {self.config.sell_retry_max_slippage:.3f})",
                     "warning",
                 )
+                if ratchet_anchor > 0:
+                    self._mark_partial_tp_hold_to_expiry(
+                        position,
+                        "ratchet_sell_retry_slippage_cap_hit",
+                    )
                 return False
             # Realized PnL should be based on the actual submitted exit price/size,
             # not on pre-trade mark price snapshots.
