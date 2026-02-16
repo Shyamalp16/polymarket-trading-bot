@@ -22,7 +22,7 @@ Example:
 """
 
 import time
-import random
+import secrets
 import json
 import os
 import queue
@@ -491,7 +491,10 @@ class OrderSigner:
             SignerError: If signing fails
         """
         try:
-            salt = random.randint(1, 2**31)
+            # Use cryptographically strong salt while staying within the
+            # JSON/JavaScript safe integer range expected by some CLOB
+            # request validators.
+            salt = secrets.randbelow((1 << 53) - 1) + 1
             order_message = self._order_message(order, salt)
             signature = ""
             started = time.perf_counter()
@@ -518,7 +521,7 @@ class OrderSigner:
             # Return the full order in CLOB API format
             # (all numeric fields as strings, side as "BUY"/"SELL",
             #  signature inside the order dict)
-            return {
+            signed_order = {
                 "order": {
                     "salt": salt,
                     "maker": order_message["maker"],
@@ -535,6 +538,17 @@ class OrderSigner:
                     "signature": signature,
                 },
             }
+
+            logger.debug(
+                "Signed order: %s %s salt=%s maker=%s taker=%s",
+                order.side,
+                order.token_id[:16],
+                salt,
+                order.maker_amount,
+                order.taker_amount,
+            )
+
+            return signed_order
 
         except Exception as e:
             raise SignerError(f"Failed to sign order: {e}")

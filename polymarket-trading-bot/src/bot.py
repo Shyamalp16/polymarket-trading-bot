@@ -39,7 +39,7 @@ from enum import Enum
 
 from .config import Config, BuilderConfig
 from .signer import OrderSigner, Order
-from .client import ClobClient, RelayerClient, ApiCredentials, BalanceError
+from .client import ClobClient, RelayerClient, ApiCredentials, BalanceError, DuplicateOrderError
 from .crypto import KeyManager, CryptoError, InvalidPasswordError
 from lib.latency_metrics import record_latency
 
@@ -403,6 +403,16 @@ class TradingBot:
             return OrderResult(
                 success=False,
                 message=str(e)
+            )
+        except DuplicateOrderError as e:
+            logger.warning(
+                f"Duplicate order rejected by CLOB: {side} {size}@{price} "
+                f"token={token_id[:16]}..."
+            )
+            return OrderResult(
+                success=False,
+                message=str(e),
+                data={"duplicate": True},
             )
         except Exception as e:
             logger.error(f"Failed to place order: {e}")

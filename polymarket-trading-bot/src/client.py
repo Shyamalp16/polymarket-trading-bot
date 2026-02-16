@@ -70,6 +70,15 @@ class BalanceError(OrderError):
     pass
 
 
+class DuplicateOrderError(OrderError):
+    """Raised when the CLOB rejects an order as duplicated.
+
+    This error is NOT retryable because replaying the same signed payload
+    will produce the same duplicate rejection.
+    """
+    pass
+
+
 @dataclass
 class ApiCredentials:
     """User-level API credentials for CLOB."""
@@ -152,8 +161,16 @@ class ApiClient(ThreadLocalSessionMixin):
         if headers:
             request_headers.update(headers)
 
+        # POST /order must NEVER be retried with the same signed payload.
+        # If the first attempt succeeded on the server but the response was
+        # lost (timeout/reset), a retry sends the identical order hash and
+        # triggers "Duplicated" — the bot then treats a successful fill as
+        # a failure.  We detect this case and skip retries entirely.
+        is_order_post = method.upper() == "POST" and endpoint.rstrip("/") == "/order"
+        effective_retries = 1 if is_order_post else self.retry_count
+
         last_error = None
-        for attempt in range(self.retry_count):
+        for attempt in range(effective_retries):
             try:
                 session = self.session
                 if method.upper() == "GET":
@@ -196,13 +213,19 @@ class ApiClient(ThreadLocalSessionMixin):
                         f"HTTP {response.status_code} {method} {endpoint}: {error_body}"
                     )
 
+                    body_lc = error_body.lower()
+
                     # Balance/allowance errors are NOT retryable — break
-                    # out immediately instead of wasting 3 retries.
-                    if (
-                        response.status_code == 400
-                        and "not enough balance" in error_body.lower()
-                    ):
+                    # out immediately instead of wasting retries.
+                    if response.status_code == 400 and "not enough balance" in body_lc:
                         raise BalanceError(
+                            f"{response.status_code} {method} {endpoint}: {error_body}"
+                        )
+
+                    # Duplicate order errors are also NOT retryable.
+                    # Retrying replays the same signed payload and fails again.
+                    if response.status_code == 400 and "duplicated" in body_lc:
+                        raise DuplicateOrderError(
                             f"{response.status_code} {method} {endpoint}: {error_body}"
                         )
 
@@ -213,14 +236,23 @@ class ApiClient(ThreadLocalSessionMixin):
 
                 return response.json() if response.text else {}
 
-            except BalanceError:
+            except (BalanceError, DuplicateOrderError):
                 raise  # NOT retryable — propagate immediately
-            except (requests.exceptions.RequestException, ApiError) as e:
+            except ApiError:
+                raise  # Server responded with a clear rejection — propagate as-is
+            except requests.exceptions.RequestException as e:
                 last_error = e
-                if attempt < self.retry_count - 1:
+                # For order POSTs, transport errors are ambiguous — the server
+                # may have already accepted the order.  Do NOT retry.
+                if is_order_post:
+                    raise ApiError(
+                        f"Order submission failed (transport error, order may "
+                        f"have been accepted): {last_error}"
+                    )
+                if attempt < effective_retries - 1:
                     time.sleep(2 ** attempt)  # Exponential backoff
 
-        raise ApiError(f"Request failed after {self.retry_count} attempts: {last_error}")
+        raise ApiError(f"Request failed after {effective_retries} attempts: {last_error}")
 
 
 class ClobClient(ApiClient):

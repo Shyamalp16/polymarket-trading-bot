@@ -57,7 +57,7 @@ class StrategyConfig:
     partial_tp_force_sell_pct: float = 0.40
     partial_tp_depth_levels: int = 3
     partial_tp_max_depth_fraction: float = 0.25
-    partial_tp_step_cooldown_seconds: float = 12.0
+    partial_tp_step_cooldown_seconds: float = 30.0
     sell_retry_price_step: float = 0.01
     sell_retry_max_slippage: float = 0.03
     sell_retry_no_wait_on_fok: bool = True
@@ -235,6 +235,47 @@ class BaseStrategy(ABC):
         Subclasses can override to attach signal state, raw features, etc.
         """
         return {}
+
+    def _infer_fill_price(
+        self,
+        side: str,
+        result_data: Dict[str, Any],
+        order_details: Optional[Dict[str, Any]],
+        best_ask: float,
+        mid_price: float,
+    ) -> float:
+        """Infer the actual execution price for a filled FOK order.
+
+        The CLOB POST /order response doesn't include the fill price.
+        We try multiple sources in order of reliability:
+        1. average_price field from order response/details (rare but authoritative)
+        2. best_ask at order time (for BUY — what a taker FOK actually pays)
+        3. mid_price (last resort fallback)
+
+        NOTE: The ``price`` field on order details is the *limit* price we
+        submitted (current_price + 0.05 for aggressive FOK), NOT the fill
+        price.  We intentionally skip it.
+        """
+        sources: List[Dict[str, Any]] = [result_data]
+        if order_details:
+            sources.append(order_details)
+
+        for src in sources:
+            for key in ("average_price", "avgPrice", "averagePrice", "matchPrice"):
+                val = src.get(key)
+                if val is not None:
+                    try:
+                        price = float(val)
+                        if 0 < price < 1:
+                            return price
+                    except (TypeError, ValueError):
+                        pass
+
+        # For a BUY FOK, the taker pays the ask side of the book.
+        if side.upper() == "BUY" and 0 < best_ask < 1:
+            return best_ask
+
+        return mid_price
 
     def _time_remaining_secs(self) -> Optional[int]:
         market = self.current_market
@@ -1149,6 +1190,10 @@ class BaseStrategy(ABC):
                 self._balance_block_until = now + self._BALANCE_COOLDOWN
                 return False
 
+        # Capture best ask before order — this is what a taker FOK actually
+        # pays and is far more accurate than mid_price for entry tracking.
+        best_ask_at_entry = self.market.get_best_ask(side)
+
         self.log(f"BUY {side.upper()} @ {current_price:.4f} size={size:.2f}", "trade")
 
         submit_started = time.perf_counter()
@@ -1213,12 +1258,23 @@ class BaseStrategy(ABC):
             await self.bot.refresh_balances(token_id=token_id)
             self._balance_block_until = 0.0  # clear cooldown on success
             self._last_blocked_buy_slug = None
-            self.log(f"Order filled: {result.order_id} size={tracked_size:.2f}", "success")
+
+            # Infer actual fill price — mid_price under-reports entry for
+            # taker buys, causing phantom PnL and premature TP triggers.
+            actual_entry = self._infer_fill_price(
+                "BUY", result.data, order_details,
+                best_ask_at_entry, current_price,
+            )
+            self.log(
+                f"Order filled: {result.order_id} size={tracked_size:.2f} "
+                f"entry={actual_entry:.4f} (mid={current_price:.4f}, ask={best_ask_at_entry:.4f})",
+                "success",
+            )
             position = self.positions.open_position(
                 side=side,
                 token_id=token_id,
                 market_slug=current_slug,
-                entry_price=current_price,
+                entry_price=actual_entry,
                 size=tracked_size,
                 order_id=result.order_id,
             )
