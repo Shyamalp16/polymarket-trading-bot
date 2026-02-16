@@ -73,8 +73,8 @@ def main():
     parser.add_argument(
         "--stop-loss",
         type=float,
-        default=0.05,
-        help="Stop loss in dollars (default: 0.05)"
+        default=0.20,
+        help="Stop loss in dollars (default: 0.20)"
     )
     parser.add_argument(
         "--debug",

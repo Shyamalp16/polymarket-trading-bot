@@ -60,7 +60,7 @@ DEFAULTS_15M = dict(
     size=5.0,
     max_positions=1,
     take_profit=0.75,     # 75% profit target
-    stop_loss=0.10,       # 10% stop loss
+    stop_loss=0.20,       # 20% stop loss
 
     # Market timing
     market_check_interval=30.0,

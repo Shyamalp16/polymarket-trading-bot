@@ -58,7 +58,7 @@ DEFAULTS_5M = dict(
     size=6.0,
     max_positions=1,
     take_profit=0.50,     # 50% profit target
-    stop_loss=0.10,       # 10% stop loss (after first minute)
+    stop_loss=0.20,       # 20% stop loss (after first minute)
     early_stop_loss=0.30, # 30% stop loss during first minute of market
     early_sl_window=60,   # First 60 seconds use wider SL
 

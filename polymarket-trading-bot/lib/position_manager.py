@@ -10,7 +10,7 @@ Provides:
 Usage:
     from lib import PositionManager, Position
 
-    manager = PositionManager(take_profit=0.10, stop_loss=0.05)
+    manager = PositionManager(take_profit=0.10, stop_loss=0.20)
 
     # Open position
     pos = manager.open_position(
@@ -50,7 +50,7 @@ class Position:
 
     # TP/SL config as percentage of entry price (set by PositionManager)
     take_profit_delta: float = 0.50   # 50% profit
-    stop_loss_delta: float = 0.15     # 15% loss
+    stop_loss_delta: float = 0.20     # 20% loss
 
     @property
     def take_profit_price(self) -> float:
@@ -97,7 +97,7 @@ class PositionManager:
     """
 
     take_profit: float = 0.10  # +10 cents
-    stop_loss: float = 0.05  # -5 cents
+    stop_loss: float = 0.20  # 20% loss
     max_positions: int = 1  # Max concurrent positions
 
     # State

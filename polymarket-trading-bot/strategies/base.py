@@ -24,7 +24,7 @@ import asyncio
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
 from lib.console import LogBuffer, log
 from lib.market_manager import MarketManager, MarketInfo
@@ -44,11 +44,19 @@ class StrategyConfig:
     size: float = 5.0  # USDC size per trade
     max_positions: int = 1
     take_profit: float = 0.10
-    stop_loss: float = 0.05
+    stop_loss: float = 0.20
     early_stop_loss: float = 0.30   # Wider SL during the first minute of the market
     early_sl_window: int = 60       # Seconds from market start for the wider SL
     use_time_phase_exits: bool = True
     min_hold_before_exit_seconds: float = 8.0
+    partial_tp_enabled: bool = True
+    partial_tp_time_force_enabled: bool = True
+    partial_tp_late_hold_threshold: float = 0.15
+    partial_tp_force_elapsed_threshold: float = 0.30
+    partial_tp_force_min_profit_pct: float = 0.08
+    partial_tp_force_sell_pct: float = 0.40
+    partial_tp_depth_levels: int = 3
+    partial_tp_max_depth_fraction: float = 0.25
     sell_retry_price_step: float = 0.01
     sell_retry_max_slippage: float = 0.03
     sell_retry_no_wait_on_fok: bool = True
@@ -148,6 +156,7 @@ class BaseStrategy(ABC):
         # period so the log isn't flooded.
         self._balance_block_until: float = 0.0  # time.time() when next re-check allowed
         self._BALANCE_COOLDOWN: float = 60.0    # seconds between re-checks
+        self._partial_tp_state: Dict[str, Dict[str, Any]] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -457,6 +466,175 @@ class BaseStrategy(ABC):
         total = max(1, self.config.market_duration * 60)
         return 60 if total <= 300 else 180
 
+    @staticmethod
+    def _partial_tp_profile(entry_price: float) -> Dict[str, object]:
+        """Adaptive partial TP profile by entry price."""
+        if entry_price < 0.40:
+            return {
+                "steps": [{"gain": 0.40, "sell_pct": 0.25}, {"gain": 0.90, "sell_pct": 0.35}],
+                "hold_remainder": 0.40,
+                "label": "deep_value",
+            }
+        if entry_price < 0.65:
+            return {
+                "steps": [{"gain": 0.22, "sell_pct": 0.30}, {"gain": 0.45, "sell_pct": 0.30}],
+                "hold_remainder": 0.40,
+                "label": "mid_range",
+            }
+        return {
+            "steps": [{"gain": 0.12, "sell_pct": 0.35}, {"gain": 0.25, "sell_pct": 0.35}],
+            "hold_remainder": 0.30,
+            "label": "high_conviction",
+        }
+
+    def _ensure_partial_tp_state(self, position: Position) -> Dict[str, Any]:
+        state = self._partial_tp_state.get(position.id)
+        if state:
+            return state
+        state = {
+            "step": 0,
+            "initial_size": float(position.size),
+            "realized_proceeds": 0.0,
+            "profile": self._partial_tp_profile(position.entry_price),
+        }
+        self._partial_tp_state[position.id] = state
+        return state
+
+    def _can_partial_sell(self, side: str, sell_shares: float) -> Dict[str, object]:
+        """Thin-book guard for partial TP exits."""
+        ob = self.market.get_orderbook(side)
+        if not ob or not ob.bids:
+            return {"executable": False, "suggestion": 0.0, "method": "none"}
+        best_bid_size = float(ob.bids[0].size)
+        depth_levels = max(1, int(self.config.partial_tp_depth_levels))
+        depth = sum(float(level.size) for level in ob.bids[:depth_levels])
+        max_safe = depth * max(0.0, min(1.0, float(self.config.partial_tp_max_depth_fraction)))
+        if sell_shares <= best_bid_size:
+            return {"executable": True, "method": "single", "suggestion": sell_shares}
+        if sell_shares <= max_safe:
+            return {"executable": True, "method": "split_2", "suggestion": sell_shares}
+        suggestion = max(0.0, min(sell_shares, max_safe))
+        return {"executable": suggestion >= 0.01, "method": "reduced", "suggestion": suggestion}
+
+    async def _execute_partial_sell(
+        self,
+        position: Position,
+        current_price: float,
+        shares_to_sell: float,
+        label: str,
+    ) -> bool:
+        """Sell part of a position and keep the remainder open."""
+        sell_size = int(max(0.0, float(shares_to_sell)) * 100) / 100.0
+        if sell_size < 0.01:
+            return False
+        if sell_size >= position.size:
+            return await self.execute_sell(position, current_price, exit_reason=label)
+
+        best_bid = self.market.get_best_bid(position.side)
+        base_price = max(current_price - 0.05, 0.01)
+        sell_price = max(0.01, min(base_price, best_bid)) if best_bid > 0 else base_price
+        result = await self.bot.place_order(
+            token_id=position.token_id,
+            price=sell_price,
+            size=sell_size,
+            side="SELL",
+            order_type="FOK",
+        )
+        if not result.success:
+            self.log(f"Partial TP skipped ({label}): {result.message}", "warning")
+            return False
+
+        realized_pnl = (sell_price - position.entry_price) * sell_size
+        old_size = position.size
+        position.size = max(0.01, old_size - sell_size)
+        self.positions.total_pnl += realized_pnl
+        state = self._partial_tp_state.get(position.id)
+        if state is not None:
+            state["realized_proceeds"] = float(state.get("realized_proceeds", 0.0)) + (sell_price * sell_size)
+        self.log(
+            f"PARTIAL TP ({label}): sold {sell_size:.2f} {position.side.upper()} @ {sell_price:.4f} "
+            f"PnL=${realized_pnl:+.2f} remaining={position.size:.2f}",
+            "success",
+        )
+        self._telemetry_log(
+            {
+                "event_type": "partial_exit",
+                "size": round(position.entry_price * sell_size, 6),
+                "entry_price": position.entry_price,
+                "exit_price": sell_price,
+                "size_shares": sell_size,
+                "hold_seconds": round(position.get_hold_time(), 3),
+            }
+        )
+        await self.bot.refresh_balances(token_id=position.token_id)
+        return True
+
+    async def _maybe_partial_tp(
+        self,
+        position: Position,
+        current_price: float,
+        time_remaining_secs: int,
+    ) -> bool:
+        """Check and execute laddered partial TP step(s)."""
+        if not self.config.partial_tp_enabled:
+            return False
+        if position.entry_price <= 0 or current_price <= 0:
+            return False
+
+        state = self._ensure_partial_tp_state(position)
+        profile = state.get("profile", {})
+        steps = profile.get("steps", [])
+        step_idx = int(state.get("step", 0))
+        if step_idx >= len(steps):
+            return False
+
+        total_window = max(1, int(self.config.market_duration * 60))
+        time_frac = max(0.0, min(1.0, float(time_remaining_secs) / float(total_window)))
+        pnl_pct = (current_price - position.entry_price) / position.entry_price
+        if time_frac < self.config.partial_tp_late_hold_threshold:
+            return False
+
+        if (
+            self.config.partial_tp_time_force_enabled
+            and step_idx == 0
+            and time_frac < self.config.partial_tp_force_elapsed_threshold
+            and pnl_pct > self.config.partial_tp_force_min_profit_pct
+        ):
+            sell_amount = float(state["initial_size"]) * self.config.partial_tp_force_sell_pct
+            sell_amount = min(sell_amount, position.size)
+            liq = self._can_partial_sell(position.side, sell_amount)
+            if not liq.get("executable", False):
+                return False
+            sell_amount = float(liq.get("suggestion", sell_amount))
+            if await self._execute_partial_sell(position, current_price, sell_amount, "TP1_time_force"):
+                state["step"] = 1
+                return True
+            return False
+
+        target = steps[step_idx]
+        if pnl_pct < float(target.get("gain", 0.0)):
+            return False
+        sell_amount = float(state["initial_size"]) * float(target.get("sell_pct", 0.0))
+        sell_amount = min(sell_amount, position.size)
+        liq = self._can_partial_sell(position.side, sell_amount)
+        if not liq.get("executable", False):
+            return False
+        sell_amount = float(liq.get("suggestion", sell_amount))
+        method = str(liq.get("method", "single"))
+        if method == "split_2" and sell_amount >= 0.02:
+            half = int((sell_amount / 2.0) * 100) / 100.0
+            rem = max(0.0, sell_amount - half)
+            ok1 = await self._execute_partial_sell(position, current_price, half, f"TP{step_idx+1}_a")
+            ok2 = await self._execute_partial_sell(position, current_price, rem, f"TP{step_idx+1}_b") if ok1 else False
+            if ok1 and ok2:
+                state["step"] = step_idx + 1
+                return True
+            return False
+        if await self._execute_partial_sell(position, current_price, sell_amount, f"TP{step_idx+1}"):
+            state["step"] = step_idx + 1
+            return True
+        return False
+
     def _update_dynamic_stop_loss(self) -> None:
         """
         Dynamically adjust stop-loss on open positions based on market age.
@@ -517,6 +695,16 @@ class BaseStrategy(ABC):
                 continue
             if position.get_hold_time() < self.config.min_hold_before_exit_seconds:
                 continue
+            if await self._maybe_partial_tp(position, current_price, time_remaining):
+                continue
+
+            # When partial TP is managing this position, suppress the
+            # phase-based full TP so the remainder rides to expiry.
+            # Only stop-loss is kept as a safety net.
+            partial_tp_managing = (
+                self.config.partial_tp_enabled
+                and position.id in self._partial_tp_state
+            )
 
             tp_delta, sl_delta, hold_to_expiry, phase = self._phase_exit_params(time_remaining)
             position.stop_loss_delta = sl_delta
@@ -528,7 +716,12 @@ class BaseStrategy(ABC):
                 pnl_pct = (current_price - position.entry_price) / position.entry_price
 
             exit_type: Optional[str] = None
-            if hold_to_expiry:
+            if partial_tp_managing:
+                # Partial TP ladder owns take-profit for this position.
+                # Only allow stop-loss; the remainder holds to expiry.
+                if pnl_pct <= -sl_delta:
+                    exit_type = "stop_loss"
+            elif hold_to_expiry:
                 # Late phase: hold by default, only mercy-stop severe losers.
                 if pnl_pct <= -sl_delta:
                     exit_type = "stop_loss"
@@ -692,6 +885,7 @@ class BaseStrategy(ABC):
         shares = tracked_size if tracked_size is not None else max(0.0, position.size)
         shares = max(0.0, int(shares * 100) / 100.0)
         entry_notional = position.entry_price * shares
+        self._partial_tp_state.pop(position.id, None)
         self.positions.close_position(position.id, realized_pnl=0.0)
         self.log(
             f"Wallet sync: external sell closed {position.side.upper()} position "
@@ -875,6 +1069,12 @@ class BaseStrategy(ABC):
             )
             if position:
                 entry_notional = position.entry_price * position.size
+                self._partial_tp_state[position.id] = {
+                    "step": 0,
+                    "initial_size": float(position.size),
+                    "realized_proceeds": 0.0,
+                    "profile": self._partial_tp_profile(position.entry_price),
+                }
                 self._telemetry_log(
                     {
                         "event_type": "entry",
@@ -1064,6 +1264,7 @@ class BaseStrategy(ABC):
                         "hold_seconds": round(position.get_hold_time(), 3),
                     }
                 )
+                self._partial_tp_state.pop(position.id, None)
                 self.positions.close_position(position.id, realized_pnl=realized_pnl)
                 # Refresh both caches so next buy sees updated USDC balance
                 await self.bot.refresh_balances(token_id=position.token_id)
