@@ -32,6 +32,7 @@ Example:
 import os
 import asyncio
 import logging
+import time
 from typing import Optional, Dict, Any, List, Callable, TypeVar
 from dataclasses import dataclass, field
 from enum import Enum
@@ -40,6 +41,7 @@ from .config import Config, BuilderConfig
 from .signer import OrderSigner, Order
 from .client import ClobClient, RelayerClient, ApiCredentials, BalanceError
 from .crypto import KeyManager, CryptoError, InvalidPasswordError
+from lib.latency_metrics import record_latency
 
 
 # Configure logging
@@ -371,10 +373,16 @@ class TradingBot:
             signed = signer.sign_order(order, neg_risk=neg_risk)
 
             # Submit to CLOB
+            submit_started = time.perf_counter()
             response = await self._run_in_thread(
                 self.clob_client.post_order,
                 signed,
                 order_type,
+            )
+            record_latency(
+                "clob_post_order_ms",
+                (time.perf_counter() - submit_started) * 1000.0,
+                {"side": side, "order_type": order_type},
             )
 
             logger.info(

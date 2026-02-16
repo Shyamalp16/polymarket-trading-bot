@@ -46,6 +46,7 @@ class Position:
     size: float
     entry_time: float
     order_id: Optional[str] = None
+    market_slug: str = ""
 
     # TP/SL config as percentage of entry price (set by PositionManager)
     take_profit_delta: float = 0.50   # 50% profit
@@ -140,6 +141,7 @@ class PositionManager:
         entry_price: float,
         size: float,
         order_id: Optional[str] = None,
+        market_slug: str = "",
     ) -> Optional[Position]:
         """
         Open a new position.
@@ -171,6 +173,7 @@ class PositionManager:
             size=size,
             entry_time=time.time(),
             order_id=order_id,
+            market_slug=market_slug,
             take_profit_delta=self.take_profit,
             stop_loss_delta=self.stop_loss,
         )

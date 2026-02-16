@@ -23,11 +23,22 @@ Example:
 
 import time
 import random
+import json
+import os
+import queue
+import subprocess
+import threading
+import logging
+from pathlib import Path
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils import to_checksum_address
+
+from lib.latency_metrics import record_latency
+
+logger = logging.getLogger(__name__)
 
 
 # USDC has 6 decimal places
@@ -115,6 +126,128 @@ class SignerError(Exception):
     pass
 
 
+class NodeSignerBridge:
+    """Persistent Node subprocess bridge for EIP-712 order signing."""
+
+    def __init__(
+        self,
+        private_key: str,
+        chain_id: int,
+        enabled: bool = True,
+        timeout_sec: float = 1.5,
+        script_path: Optional[str] = None,
+    ) -> None:
+        self.enabled = enabled
+        self.chain_id = int(chain_id)
+        self.timeout_sec = max(0.1, float(timeout_sec))
+        self.script_path = (
+            Path(script_path)
+            if script_path
+            else Path(__file__).resolve().parent.parent / "scripts" / "js_order_signer.mjs"
+        )
+        self._private_key = private_key if private_key.startswith("0x") else f"0x{private_key}"
+        self._proc: Optional[subprocess.Popen[str]] = None
+        self._io_lock = threading.Lock()
+        self._rpc_id = 0
+        self._disabled_reason: str = ""
+
+    def _readline_with_timeout(self) -> str:
+        if not self._proc or not self._proc.stdout:
+            raise SignerError("JS signer stdout unavailable")
+        q: "queue.Queue[str]" = queue.Queue(maxsize=1)
+
+        def _reader() -> None:
+            try:
+                line = self._proc.stdout.readline()
+            except Exception:
+                line = ""
+            try:
+                q.put_nowait(line)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        try:
+            return q.get(timeout=self.timeout_sec)
+        except queue.Empty as exc:
+            raise SignerError("JS signer timed out") from exc
+
+    def _spawn(self) -> None:
+        if not self.enabled:
+            raise SignerError("JS signer disabled")
+        if self._proc and self._proc.poll() is None:
+            return
+        if not self.script_path.exists():
+            raise SignerError(f"JS signer script not found: {self.script_path}")
+
+        env = os.environ.copy()
+        env["POLY_SIGNER_PRIVATE_KEY"] = self._private_key
+        env["POLY_SIGNER_CHAIN_ID"] = str(self.chain_id)
+        self._proc = subprocess.Popen(
+            ["node", str(self.script_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+            env=env,
+        )
+        self.health_check()
+
+    def _rpc(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        self._spawn()
+        if not self._proc or not self._proc.stdin or not self._proc.stdout:
+            raise SignerError("JS signer process unavailable")
+        with self._io_lock:
+            self._rpc_id += 1
+            req = {"id": self._rpc_id, "method": method, "params": params}
+            self._proc.stdin.write(json.dumps(req) + "\n")
+            self._proc.stdin.flush()
+            line = self._readline_with_timeout().strip()
+        if not line:
+            raise SignerError("JS signer returned empty response")
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise SignerError(f"Invalid JS signer response: {line[:200]}") from exc
+        if msg.get("error"):
+            raise SignerError(str(msg.get("error")))
+        return msg
+
+    def health_check(self) -> bool:
+        resp = self._rpc("health", {})
+        return bool(resp.get("ok", False))
+
+    def sign_order(self, payload: Dict[str, Any]) -> str:
+        resp = self._rpc("sign_order", payload)
+        sig = str(resp.get("signature", ""))
+        if not sig.startswith("0x"):
+            raise SignerError("JS signer did not return hex signature")
+        return sig
+
+    def mark_disabled(self, reason: str) -> None:
+        self.enabled = False
+        self._disabled_reason = reason
+        logger.warning("JS signer disabled: %s", reason)
+        self.close()
+
+    def close(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if not proc:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=0.5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
 class OrderSigner:
     """
     Signs Polymarket orders using EIP-712.
@@ -173,6 +306,8 @@ class OrderSigner:
         ]
     }
 
+    ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
     def __init__(self, private_key: str):
         """
         Initialize signer with a private key.
@@ -192,6 +327,82 @@ class OrderSigner:
             raise ValueError(f"Invalid private key: {e}")
 
         self.address = self.wallet.address
+        self._chain_id = int(self.ORDER_DOMAIN["chainId"])
+        self._maker_checksum_cache: Dict[str, str] = {}
+        self._order_payload_cache: Dict[bool, Dict[str, Any]] = {
+            False: {"domain_data": self.ORDER_DOMAIN, "message_types": self.ORDER_TYPES},
+            True: {"domain_data": self.NEG_RISK_ORDER_DOMAIN, "message_types": self.ORDER_TYPES},
+        }
+        js_enabled = os.environ.get("POLY_JS_SIGNER_ENABLED", "1").lower() not in {"0", "false", "no"}
+        js_timeout = float(os.environ.get("POLY_JS_SIGNER_TIMEOUT_SEC", "1.5"))
+        js_script = os.environ.get("POLY_JS_SIGNER_SCRIPT", "")
+        self._js_bridge = NodeSignerBridge(
+            private_key=f"0x{private_key}",
+            chain_id=self._chain_id,
+            enabled=js_enabled,
+            timeout_sec=js_timeout,
+            script_path=js_script or None,
+        )
+
+    def _checksum_maker(self, maker: str) -> str:
+        if maker in self._maker_checksum_cache:
+            return self._maker_checksum_cache[maker]
+        checksum = to_checksum_address(maker)
+        self._maker_checksum_cache[maker] = checksum
+        return checksum
+
+    def _order_message(self, order: Order, salt: int) -> Dict[str, Any]:
+        return {
+            "salt": int(salt),
+            "maker": self._checksum_maker(order.maker),
+            "signer": self.address,
+            "taker": self.ZERO_ADDRESS,
+            "tokenId": int(order.token_id),
+            "makerAmount": int(order.maker_amount),
+            "takerAmount": int(order.taker_amount),
+            "expiration": 0,
+            "nonce": 0,
+            "feeRateBps": int(order.fee_rate_bps),
+            "side": int(order.side_value),
+            "signatureType": int(order.signature_type),
+        }
+
+    def _sign_order_python(
+        self,
+        order_message: Dict[str, Any],
+        neg_risk: bool,
+    ) -> str:
+        signable = encode_typed_data(
+            domain_data=self._order_payload_cache[neg_risk]["domain_data"],
+            message_types=self._order_payload_cache[neg_risk]["message_types"],
+            message_data=order_message,
+        )
+        signed = self.wallet.sign_message(signable)
+        return "0x" + signed.signature.hex()
+
+    def _sign_order_js(
+        self,
+        order_message: Dict[str, Any],
+        neg_risk: bool,
+    ) -> str:
+        payload = {
+            "negRisk": bool(neg_risk),
+            "message": {
+                "salt": str(order_message["salt"]),
+                "maker": str(order_message["maker"]),
+                "signer": str(order_message["signer"]),
+                "taker": str(order_message["taker"]),
+                "tokenId": str(order_message["tokenId"]),
+                "makerAmount": str(order_message["makerAmount"]),
+                "takerAmount": str(order_message["takerAmount"]),
+                "expiration": str(order_message["expiration"]),
+                "nonce": str(order_message["nonce"]),
+                "feeRateBps": str(order_message["feeRateBps"]),
+                "side": int(order_message["side"]),
+                "signatureType": int(order_message["signatureType"]),
+            },
+        }
+        return self._js_bridge.sign_order(payload)
 
     @classmethod
     def from_encrypted(
@@ -281,35 +492,28 @@ class OrderSigner:
         """
         try:
             salt = random.randint(1, 2**31)
-
-            # Build order message for EIP-712 signing (all ints for uint256)
-            order_message = {
-                "salt": salt,
-                "maker": to_checksum_address(order.maker),
-                "signer": self.address,
-                "taker": "0x0000000000000000000000000000000000000000",
-                "tokenId": int(order.token_id),
-                "makerAmount": int(order.maker_amount),
-                "takerAmount": int(order.taker_amount),
-                "expiration": 0,
-                "nonce": 0,
-                "feeRateBps": order.fee_rate_bps,
-                "side": order.side_value,
-                "signatureType": order.signature_type,
-            }
-
-            # Use the correct exchange domain for signing
-            domain = self.NEG_RISK_ORDER_DOMAIN if neg_risk else self.ORDER_DOMAIN
-
-            # Sign the order using EIP-712 with Exchange domain
-            signable = encode_typed_data(
-                domain_data=domain,
-                message_types=self.ORDER_TYPES,
-                message_data=order_message
+            order_message = self._order_message(order, salt)
+            signature = ""
+            started = time.perf_counter()
+            use_js = self._js_bridge.enabled
+            if use_js:
+                try:
+                    signature = self._sign_order_js(order_message, neg_risk=neg_risk)
+                except Exception as js_exc:
+                    logger.warning("JS signer failed, using Python fallback: %s", js_exc)
+                    self._js_bridge.mark_disabled(str(js_exc))
+            if not signature:
+                signature = self._sign_order_python(order_message, neg_risk=neg_risk)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            record_latency(
+                "sign_order_ms",
+                elapsed_ms,
+                {
+                    "backend": "js" if use_js and self._js_bridge.enabled else "python",
+                    "neg_risk": bool(neg_risk),
+                    "order_type": order.order_type,
+                },
             )
-
-            signed = self.wallet.sign_message(signable)
-            signature = "0x" + signed.signature.hex()
 
             # Return the full order in CLOB API format
             # (all numeric fields as strings, side as "BUY"/"SELL",
@@ -317,9 +521,9 @@ class OrderSigner:
             return {
                 "order": {
                     "salt": salt,
-                    "maker": to_checksum_address(order.maker),
+                    "maker": order_message["maker"],
                     "signer": self.address,
-                    "taker": "0x0000000000000000000000000000000000000000",
+                    "taker": self.ZERO_ADDRESS,
                     "tokenId": order.token_id,
                     "makerAmount": str(int(order.maker_amount)),
                     "takerAmount": str(int(order.taker_amount)),

@@ -18,16 +18,35 @@ Example:
     await ws.run()
 """
 
-import json
 import asyncio
 import logging
+import json
+import time
 from typing import Optional, Dict, Any, List, Callable, Set, Union, Awaitable, TYPE_CHECKING
 from dataclasses import dataclass, field
+from lib.latency_metrics import record_latency
 
 if TYPE_CHECKING:
     from websockets.client import WebSocketClientProtocol
 
 logger = logging.getLogger(__name__)
+
+try:
+    import orjson as _orjson  # type: ignore[import-not-found]
+except Exception:
+    _orjson = None
+
+
+def _json_loads(raw: Union[str, bytes]) -> Any:
+    if _orjson is not None:
+        return _orjson.loads(raw)
+    return json.loads(raw)
+
+
+def _json_dumps(payload: Dict[str, Any]) -> str:
+    if _orjson is not None:
+        return _orjson.dumps(payload).decode("utf-8")
+    return json.dumps(payload)
 
 
 # WebSocket endpoints
@@ -193,6 +212,7 @@ class MarketWebSocket:
         self,
         url: str = WSS_MARKET_URL,
         reconnect_interval: float = 5.0,
+        max_reconnect_interval: float = 30.0,
         ping_interval: float = 20.0,
         ping_timeout: float = 10.0,
     ):
@@ -202,11 +222,13 @@ class MarketWebSocket:
         Args:
             url: WebSocket endpoint URL
             reconnect_interval: Seconds between reconnection attempts
+            max_reconnect_interval: Upper bound for reconnect delay
             ping_interval: Seconds between ping messages
             ping_timeout: Seconds to wait for pong response
         """
         self.url = url
         self.reconnect_interval = reconnect_interval
+        self.max_reconnect_interval = max_reconnect_interval
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
 
@@ -359,7 +381,7 @@ class MarketWebSocket:
         }
 
         try:
-            msg_json = json.dumps(subscribe_msg)
+            msg_json = _json_dumps(subscribe_msg)
             logger.info(f"Sending subscribe message: {msg_json[:200]}")
             await self._ws.send(msg_json)
             logger.info(f"Subscribed to {len(asset_ids)} assets successfully")
@@ -394,7 +416,7 @@ class MarketWebSocket:
         }
 
         try:
-            await self._ws.send(json.dumps(subscribe_msg))
+            await self._ws.send(_json_dumps(subscribe_msg))
             logger.info(f"Subscribed to {len(asset_ids)} additional assets")
             return True
         except Exception as e:
@@ -422,7 +444,7 @@ class MarketWebSocket:
         }
 
         try:
-            await self._ws.send(json.dumps(unsubscribe_msg))
+            await self._ws.send(_json_dumps(unsubscribe_msg))
             logger.info(f"Unsubscribed from {len(asset_ids)} assets")
             return True
         except Exception as e:
@@ -490,7 +512,9 @@ class MarketWebSocket:
                 if msg_count <= 5 or msg_count % 1000 == 0:
                     logger.info(f"WS message #{msg_count}: {message[:200] if len(message) > 200 else message}")
 
-                data = json.loads(message)
+                started = time.perf_counter()
+                data = _json_loads(message)
+                record_latency("ws_parse_ms", (time.perf_counter() - started) * 1000.0)
 
                 # Handle array of messages
                 if isinstance(data, list):
@@ -504,7 +528,7 @@ class MarketWebSocket:
             except self._connection_closed as e:
                 logger.warning(f"WebSocket connection closed: {e}")
                 break
-            except json.JSONDecodeError as e:
+            except ValueError as e:
                 logger.error(f"Failed to parse message: {e}")
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
@@ -519,16 +543,19 @@ class MarketWebSocket:
             auto_reconnect: Whether to automatically reconnect on disconnect
         """
         self._running = True
+        retry_delay = max(0.25, float(self.reconnect_interval))
 
         while self._running:
             # Connect
             if not await self.connect():
                 if auto_reconnect:
-                    logger.info(f"Reconnecting in {self.reconnect_interval}s...")
-                    await asyncio.sleep(self.reconnect_interval)
+                    logger.info(f"Reconnecting in {retry_delay:.1f}s...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(self.max_reconnect_interval, retry_delay * 2.0)
                     continue
                 else:
                     break
+            retry_delay = max(0.25, float(self.reconnect_interval))
 
             # Subscribe to assets
             if self._subscribed_assets:
@@ -546,8 +573,9 @@ class MarketWebSocket:
                 break
 
             if auto_reconnect:
-                logger.info(f"Reconnecting in {self.reconnect_interval}s...")
-                await asyncio.sleep(self.reconnect_interval)
+                logger.info(f"Reconnecting in {retry_delay:.1f}s...")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(self.max_reconnect_interval, retry_delay * 2.0)
             else:
                 break
 

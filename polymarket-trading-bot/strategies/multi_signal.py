@@ -37,9 +37,10 @@ import time
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple, Any
 
 from lib.console import Colors, format_countdown
+from lib.latency_metrics import record_latency
 from strategies.base import BaseStrategy, StrategyConfig
 from src.bot import TradingBot
 from src.websocket_client import OrderbookSnapshot
@@ -189,6 +190,9 @@ class MultiSignalConfig(StrategyConfig):
     # --- Diagnostics ---
     signal_state_logging_enabled: bool = False
     signal_state_log_interval_sec: float = 1.0
+    incremental_signals_enabled: bool = False
+    incremental_parity_logging_enabled: bool = False
+    incremental_parity_interval_sec: float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +243,16 @@ class MultiSignalStrategy(BaseStrategy):
             "threshold": 0.0,
             "pass": False,
         }
+        self._signal_cache: Dict[str, List[TradeSignal]] = {
+            "flash": [],
+            "momentum": [],
+            "imbalance": [],
+            "decay": [],
+            "spot_divergence": [],
+        }
+        self._last_price_fingerprint: Tuple[float, float] = (-1.0, -1.0)
+        self._last_book_fingerprint: Tuple[str, str] = ("", "")
+        self._last_incremental_parity_check_ts: float = 0.0
 
     # ------------------------------------------------------------------
     # BaseStrategy hooks
@@ -267,22 +281,13 @@ class MultiSignalStrategy(BaseStrategy):
         if self._is_too_close_to_expiry():
             return
 
-        # Collect signals from all enabled detectors
-        signals: List[TradeSignal] = []
-
-        if self.signal_config.flash_crash_enabled:
-            signals.extend(self._check_flash_crash(prices))
-
-        if self.signal_config.momentum_enabled:
-            signals.extend(self._check_momentum(prices))
-
-        if self.signal_config.imbalance_enabled:
-            signals.extend(self._check_orderbook_imbalance())
-
-        if self.signal_config.time_decay_enabled:
-            signals.extend(self._check_time_decay(prices))
-        if self.signal_config.spot_divergence_enabled:
-            signals.extend(self._check_spot_divergence(prices))
+        started_compute = time.perf_counter()
+        signals = self._collect_signals(prices)
+        record_latency(
+            "signal_compute_ms",
+            (time.perf_counter() - started_compute) * 1000.0,
+            {"incremental": bool(self.signal_config.incremental_signals_enabled)},
+        )
 
         self._last_signals = signals
 
@@ -366,6 +371,96 @@ class MultiSignalStrategy(BaseStrategy):
     # ------------------------------------------------------------------
     # Signal detectors
     # ------------------------------------------------------------------
+
+    def _price_fingerprint(self, prices: Dict[str, float]) -> Tuple[float, float]:
+        return (
+            round(float(prices.get("up", 0.0)), 6),
+            round(float(prices.get("down", 0.0)), 6),
+        )
+
+    def _book_fingerprint(self) -> Tuple[str, str]:
+        up = self.market.get_orderbook("up")
+        down = self.market.get_orderbook("down")
+        up_hash = up.hash if up and up.hash else f"{up.best_bid:.4f}-{up.best_ask:.4f}" if up else ""
+        down_hash = (
+            down.hash if down and down.hash else f"{down.best_bid:.4f}-{down.best_ask:.4f}" if down else ""
+        )
+        return (up_hash, down_hash)
+
+    def _collect_signals_full(self, prices: Dict[str, float]) -> List[TradeSignal]:
+        """Compute all enabled detectors from scratch."""
+        signals: List[TradeSignal] = []
+        if self.signal_config.flash_crash_enabled:
+            signals.extend(self._check_flash_crash(prices))
+        if self.signal_config.momentum_enabled:
+            signals.extend(self._check_momentum(prices))
+        if self.signal_config.imbalance_enabled:
+            signals.extend(self._check_orderbook_imbalance())
+        if self.signal_config.time_decay_enabled:
+            signals.extend(self._check_time_decay(prices))
+        if self.signal_config.spot_divergence_enabled:
+            signals.extend(self._check_spot_divergence(prices))
+        return signals
+
+    def _collect_signals(self, prices: Dict[str, float]) -> List[TradeSignal]:
+        """
+        Collect detector outputs.
+
+        Incremental mode updates only detector groups affected by data changes.
+        """
+        cfg = self.signal_config
+        if not cfg.incremental_signals_enabled:
+            return self._collect_signals_full(prices)
+
+        price_fp = self._price_fingerprint(prices)
+        book_fp = self._book_fingerprint()
+        price_changed = price_fp != self._last_price_fingerprint
+        book_changed = book_fp != self._last_book_fingerprint
+
+        if not cfg.flash_crash_enabled:
+            self._signal_cache["flash"] = []
+        elif price_changed:
+            self._signal_cache["flash"] = self._check_flash_crash(prices)
+
+        if not cfg.momentum_enabled:
+            self._signal_cache["momentum"] = []
+        elif price_changed:
+            self._signal_cache["momentum"] = self._check_momentum(prices)
+
+        if not cfg.imbalance_enabled:
+            self._signal_cache["imbalance"] = []
+        elif book_changed:
+            self._signal_cache["imbalance"] = self._check_orderbook_imbalance()
+
+        if not cfg.time_decay_enabled:
+            self._signal_cache["decay"] = []
+        elif price_changed:
+            self._signal_cache["decay"] = self._check_time_decay(prices)
+
+        if not cfg.spot_divergence_enabled:
+            self._signal_cache["spot_divergence"] = []
+        elif price_changed:
+            self._signal_cache["spot_divergence"] = self._check_spot_divergence(prices)
+
+        self._last_price_fingerprint = price_fp
+        self._last_book_fingerprint = book_fp
+
+        signals: List[TradeSignal] = []
+        for key in ["flash", "momentum", "imbalance", "decay", "spot_divergence"]:
+            signals.extend(self._signal_cache[key])
+
+        if (
+            cfg.incremental_parity_logging_enabled
+            and (time.time() - self._last_incremental_parity_check_ts) >= cfg.incremental_parity_interval_sec
+        ):
+            self._last_incremental_parity_check_ts = time.time()
+            full = self._collect_signals_full(prices)
+            inc_sig = sorted((s.source, s.side, round(s.raw_score, 3), round(s.confidence, 3)) for s in signals)
+            full_sig = sorted((s.source, s.side, round(s.raw_score, 3), round(s.confidence, 3)) for s in full)
+            if inc_sig != full_sig:
+                self.log("Incremental signal parity mismatch detected; check detector cache gating.", "warning")
+
+        return signals
 
     def _check_flash_crash(self, prices: Dict[str, float]) -> List[TradeSignal]:
         """
@@ -1366,6 +1461,16 @@ class MultiSignalStrategy(BaseStrategy):
             "threshold": 0.0,
             "pass": False,
         }
+        self._signal_cache = {
+            "flash": [],
+            "momentum": [],
+            "imbalance": [],
+            "decay": [],
+            "spot_divergence": [],
+        }
+        self._last_price_fingerprint = (-1.0, -1.0)
+        self._last_book_fingerprint = ("", "")
+        self._last_incremental_parity_check_ts = 0.0
 
     # ------------------------------------------------------------------
     # TUI Rendering

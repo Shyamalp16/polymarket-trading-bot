@@ -31,6 +31,7 @@ from lib.market_manager import MarketManager, MarketInfo
 from lib.price_tracker import PriceTracker
 from lib.position_manager import PositionManager, Position
 from lib.trade_telemetry import TradeTelemetry
+from lib.latency_metrics import record_latency
 from src.bot import TradingBot
 from src.websocket_client import OrderbookSnapshot
 
@@ -48,6 +49,9 @@ class StrategyConfig:
     early_sl_window: int = 60       # Seconds from market start for the wider SL
     use_time_phase_exits: bool = True
     min_hold_before_exit_seconds: float = 8.0
+    sell_retry_price_step: float = 0.01
+    sell_retry_max_slippage: float = 0.03
+    sell_retry_no_wait_on_fok: bool = True
 
     # Market settings
     market_duration: int = 15  # Market duration in minutes (5 or 15)
@@ -264,18 +268,15 @@ class BaseStrategy(ABC):
         @self.market.on_market_change
         def handle_market_change(old_slug: str, new_slug: str):  # pyright: ignore[reportUnusedFunction]
             self.log(f"Market changed: {old_slug} -> {new_slug}", "warning")
-            # Force-close orphaned positions from the expired market.
-            # The old market's tokens will auto-resolve on-chain;
-            # we just need to clear internal tracking so the bot
-            # can trade fresh in the new market window.
+            # Keep old-market positions tracked through resolution.
+            # They will be cleared by wallet sync when conditional token
+            # balances settle to zero after resolution/redemption.
             open_positions = self.positions.get_all_positions()
-            for pos in open_positions:
+            if open_positions:
                 self.log(
-                    f"Auto-closing position {pos.side.upper()} "
-                    f"(market expired)",
+                    "Keeping open positions for settlement; not force-closing on market switch.",
                     "warning",
                 )
-                self.positions.close_position(pos.id, realized_pnl=0.0)
             self.prices.clear()
             self._log_buffer.clear()
             self._last_blocked_buy_slug = None
@@ -507,6 +508,10 @@ class BaseStrategy(ABC):
             return
 
         for position in self.positions.get_all_positions():
+            current_slug = self._market_slug()
+            if current_slug and getattr(position, "market_slug", "") and position.market_slug != current_slug:
+                # Do not evaluate exits for an old market against the new market's prices.
+                continue
             current_price = prices.get(position.side, 0.0)
             if current_price <= 0:
                 continue
@@ -587,7 +592,11 @@ class BaseStrategy(ABC):
                 continue
 
             if wallet_size < 0.01:
-                current_price = prices.get(pos.side, 0.0)
+                current_slug = self._market_slug()
+                if current_slug and getattr(pos, "market_slug", "") and pos.market_slug != current_slug:
+                    current_price = 0.0
+                else:
+                    current_price = prices.get(pos.side, 0.0)
                 self._close_position_as_external_exit(
                     pos,
                     current_price=current_price,
@@ -793,12 +802,18 @@ class BaseStrategy(ABC):
 
         self.log(f"BUY {side.upper()} @ {current_price:.4f} size={size:.2f}", "trade")
 
+        submit_started = time.perf_counter()
         result = await self.bot.place_order(
             token_id=token_id,
             price=buy_price,
             size=size,
             side="BUY",
             order_type="FOK"
+        )
+        record_latency(
+            "order_submit_ms",
+            (time.perf_counter() - submit_started) * 1000.0,
+            {"side": "BUY", "price": round(buy_price, 6)},
         )
 
         if result.success:
@@ -853,6 +868,7 @@ class BaseStrategy(ABC):
             position = self.positions.open_position(
                 side=side,
                 token_id=token_id,
+                market_slug=current_slug,
                 entry_price=current_price,
                 size=tracked_size,
                 order_id=result.order_id,
@@ -945,6 +961,7 @@ class BaseStrategy(ABC):
         # balance endpoint until we see actual data before burning an
         # order attempt.
         max_attempts = 6
+        initial_sell_price = 0.0
         for attempt in range(max_attempts):
             # --- Phase 1: wait until the CLOB cache shows a balance ---
             # On the first attempt we poll aggressively (up to 8×3s = 24s)
@@ -995,11 +1012,26 @@ class BaseStrategy(ABC):
                 sell_price = max(0.01, min(base_price, best_bid))
             else:
                 sell_price = base_price
-            sell_price = max(0.01, sell_price - (attempt * 0.02))
+            if attempt == 0:
+                initial_sell_price = sell_price
+            step = max(0.0, float(self.config.sell_retry_price_step))
+            sell_price = max(0.01, initial_sell_price - (attempt * step))
+            realized_slippage = max(0.0, initial_sell_price - sell_price)
+            if (
+                self.config.sell_retry_max_slippage > 0
+                and realized_slippage > self.config.sell_retry_max_slippage
+            ):
+                self.log(
+                    f"Sell retries halted: slippage cap hit "
+                    f"({realized_slippage:.3f} > {self.config.sell_retry_max_slippage:.3f})",
+                    "warning",
+                )
+                return False
             # Realized PnL should be based on the actual submitted exit price/size,
             # not on pre-trade mark price snapshots.
             realized_pnl = (sell_price - position.entry_price) * sell_size
 
+            submit_started = time.perf_counter()
             result = await self.bot.place_order(
                 token_id=position.token_id,
                 price=sell_price,
@@ -1007,9 +1039,20 @@ class BaseStrategy(ABC):
                 side="SELL",
                 order_type="FOK"
             )
+            record_latency(
+                "order_submit_ms",
+                (time.perf_counter() - submit_started) * 1000.0,
+                {"side": "SELL", "attempt": attempt + 1, "price": round(sell_price, 6)},
+            )
 
             if result.success:
                 self.log(f"Sell order: full exit PnL: ${realized_pnl:+.2f}", "success")
+                if attempt > 0:
+                    self.log(
+                        f"Sell filled after {attempt+1} attempts "
+                        f"(slippage={realized_slippage:.3f})",
+                        "info",
+                    )
                 entry_notional = position.entry_price * position.size
                 self._telemetry_log(
                     {
@@ -1063,7 +1106,8 @@ class BaseStrategy(ABC):
                         f"Sell attempt {attempt+1}/{max_attempts}: FOK not filled, widening price",
                         "warning",
                     )
-                    await asyncio.sleep(0.5)
+                    if not self.config.sell_retry_no_wait_on_fok:
+                        await asyncio.sleep(0.5)
                     continue
 
             # Unknown error or final attempt — give up for this tick.
