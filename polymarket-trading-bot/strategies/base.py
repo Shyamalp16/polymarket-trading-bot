@@ -48,7 +48,7 @@ class StrategyConfig:
     early_stop_loss: float = 0.30   # Wider SL during the first minute of the market
     early_sl_window: int = 60       # Seconds from market start for the wider SL
     use_time_phase_exits: bool = True
-    min_hold_before_exit_seconds: float = 8.0
+    min_hold_before_exit_seconds: float = 30.0
     partial_tp_enabled: bool = True
     partial_tp_time_force_enabled: bool = True
     partial_tp_late_hold_threshold: float = 0.15
@@ -468,21 +468,36 @@ class BaseStrategy(ABC):
 
     @staticmethod
     def _partial_tp_profile(entry_price: float) -> Dict[str, object]:
-        """Adaptive partial TP profile by entry price."""
+        """Adaptive partial TP profile by entry price.
+
+        Each step includes ``new_sl_pct`` — the ratcheted stop-loss expressed
+        as a fraction of entry price.  After TP1 the SL moves to break-even
+        (``new_sl_pct=0.0``); after TP2 it locks at the TP1 gain level so
+        the remaining position cannot lose money.
+        """
         if entry_price < 0.40:
             return {
-                "steps": [{"gain": 0.40, "sell_pct": 0.25}, {"gain": 0.90, "sell_pct": 0.35}],
+                "steps": [
+                    {"gain": 0.40, "sell_pct": 0.25, "new_sl_pct": 0.0},
+                    {"gain": 0.90, "sell_pct": 0.35, "new_sl_pct": 0.40},
+                ],
                 "hold_remainder": 0.40,
                 "label": "deep_value",
             }
         if entry_price < 0.65:
             return {
-                "steps": [{"gain": 0.22, "sell_pct": 0.30}, {"gain": 0.45, "sell_pct": 0.30}],
+                "steps": [
+                    {"gain": 0.22, "sell_pct": 0.30, "new_sl_pct": 0.0},
+                    {"gain": 0.45, "sell_pct": 0.30, "new_sl_pct": 0.22},
+                ],
                 "hold_remainder": 0.40,
                 "label": "mid_range",
             }
         return {
-            "steps": [{"gain": 0.12, "sell_pct": 0.35}, {"gain": 0.25, "sell_pct": 0.35}],
+            "steps": [
+                {"gain": 0.12, "sell_pct": 0.35, "new_sl_pct": 0.0},
+                {"gain": 0.25, "sell_pct": 0.35, "new_sl_pct": 0.12},
+            ],
             "hold_remainder": 0.30,
             "label": "high_conviction",
         }
@@ -491,11 +506,13 @@ class BaseStrategy(ABC):
         state = self._partial_tp_state.get(position.id)
         if state:
             return state
+        initial_sl = position.entry_price * (1 - self.config.stop_loss)
         state = {
             "step": 0,
             "initial_size": float(position.size),
             "realized_proceeds": 0.0,
             "profile": self._partial_tp_profile(position.entry_price),
+            "ratchet_sl": initial_sl,
         }
         self._partial_tp_state[position.id] = state
         return state
@@ -569,6 +586,28 @@ class BaseStrategy(ABC):
         await self.bot.refresh_balances(token_id=position.token_id)
         return True
 
+    def _ratchet_sl(self, position: Position, state: Dict[str, Any], step_idx: int) -> None:
+        """Move the stop-loss up after a successful partial TP step.
+
+        ``new_sl_pct`` in the profile is the gain fraction relative to
+        entry (0.0 = break-even, 0.22 = +22% above entry).  The absolute
+        SL price is ``entry * (1 + new_sl_pct)``.
+        """
+        profile = state.get("profile", {})
+        steps = profile.get("steps", [])
+        if step_idx >= len(steps):
+            return
+        new_sl_pct = float(steps[step_idx].get("new_sl_pct", 0.0))
+        new_sl = position.entry_price * (1 + new_sl_pct)
+        old_sl = float(state.get("ratchet_sl", 0.0))
+        if new_sl > old_sl:
+            state["ratchet_sl"] = new_sl
+            label = "break-even" if new_sl_pct == 0.0 else f"+{new_sl_pct:.0%}"
+            self.log(
+                f"SL ratchet: {old_sl:.4f} → {new_sl:.4f} ({label})",
+                "info",
+            )
+
     async def _maybe_partial_tp(
         self,
         position: Position,
@@ -608,6 +647,7 @@ class BaseStrategy(ABC):
             sell_amount = float(liq.get("suggestion", sell_amount))
             if await self._execute_partial_sell(position, current_price, sell_amount, "TP1_time_force"):
                 state["step"] = 1
+                self._ratchet_sl(position, state, 0)
                 return True
             return False
 
@@ -628,10 +668,12 @@ class BaseStrategy(ABC):
             ok2 = await self._execute_partial_sell(position, current_price, rem, f"TP{step_idx+1}_b") if ok1 else False
             if ok1 and ok2:
                 state["step"] = step_idx + 1
+                self._ratchet_sl(position, state, step_idx)
                 return True
             return False
         if await self._execute_partial_sell(position, current_price, sell_amount, f"TP{step_idx+1}"):
             state["step"] = step_idx + 1
+            self._ratchet_sl(position, state, step_idx)
             return True
         return False
 
@@ -685,6 +727,10 @@ class BaseStrategy(ABC):
         if time_remaining is None:
             return
 
+        # Market in resolution — hold everything and let it settle.
+        if time_remaining <= 0:
+            return
+
         for position in self.positions.get_all_positions():
             current_slug = self._market_slug()
             if current_slug and getattr(position, "market_slug", "") and position.market_slug != current_slug:
@@ -700,14 +746,26 @@ class BaseStrategy(ABC):
 
             # When partial TP is managing this position, suppress the
             # phase-based full TP so the remainder rides to expiry.
-            # Only stop-loss is kept as a safety net.
-            partial_tp_managing = (
-                self.config.partial_tp_enabled
-                and position.id in self._partial_tp_state
+            # The ratcheted SL replaces the normal phase SL.
+            partial_tp_state = (
+                self._partial_tp_state.get(position.id)
+                if self.config.partial_tp_enabled else None
             )
 
             tp_delta, sl_delta, hold_to_expiry, phase = self._phase_exit_params(time_remaining)
-            position.stop_loss_delta = sl_delta
+
+            if partial_tp_state is not None:
+                # Use the ratcheted SL price instead of the phase-based delta.
+                # The delta can be negative when SL is above entry (profit lock).
+                ratchet_sl = float(partial_tp_state.get("ratchet_sl", 0.0))
+                if ratchet_sl > 0 and position.entry_price > 0:
+                    ratchet_delta = (position.entry_price - ratchet_sl) / position.entry_price
+                    position.stop_loss_delta = ratchet_delta
+                else:
+                    position.stop_loss_delta = sl_delta
+            else:
+                position.stop_loss_delta = sl_delta
+
             if tp_delta is not None:
                 position.take_profit_delta = tp_delta
 
@@ -716,10 +774,11 @@ class BaseStrategy(ABC):
                 pnl_pct = (current_price - position.entry_price) / position.entry_price
 
             exit_type: Optional[str] = None
-            if partial_tp_managing:
-                # Partial TP ladder owns take-profit for this position.
-                # Only allow stop-loss; the remainder holds to expiry.
-                if pnl_pct <= -sl_delta:
+            if partial_tp_state is not None:
+                # Partial TP ladder owns take-profit. Only the ratcheted
+                # stop-loss can close the remaining position.
+                ratchet_sl = float(partial_tp_state.get("ratchet_sl", 0.0))
+                if ratchet_sl > 0 and current_price <= ratchet_sl:
                     exit_type = "stop_loss"
             elif hold_to_expiry:
                 # Late phase: hold by default, only mercy-stop severe losers.
@@ -1074,6 +1133,7 @@ class BaseStrategy(ABC):
                     "initial_size": float(position.size),
                     "realized_proceeds": 0.0,
                     "profile": self._partial_tp_profile(position.entry_price),
+                    "ratchet_sl": position.entry_price * (1 - self.config.stop_loss),
                 }
                 self._telemetry_log(
                     {

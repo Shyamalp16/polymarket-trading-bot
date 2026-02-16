@@ -1650,11 +1650,14 @@ class MultiSignalStrategy(BaseStrategy):
                     f"PnL: {color}${pnl:+.2f} ({pnl_pct:+.1f}%){Colors.RESET} | "
                     f"Hold: {hold_time:.0f}s"
                 )
+                if pos.stop_loss_delta <= 0:
+                    sl_label = f"{Colors.GREEN}SL: {pos.stop_loss_price:.4f} (locked +{-pos.stop_loss_delta:.0%}){Colors.RESET}"
+                else:
+                    sl_label = f"SL: {pos.stop_loss_price:.4f} (-{pos.stop_loss_delta:.0%})"
                 lines.append(
                     f"       TP: {pos.take_profit_price:.4f} "
                     f"(+{pos.take_profit_delta:.0%}) | "
-                    f"SL: {pos.stop_loss_price:.4f} "
-                    f"(-{pos.stop_loss_delta:.0%})"
+                    f"{sl_label}"
                 )
         else:
             lines.append(f"  {Colors.CYAN}(no open positions){Colors.RESET}")
