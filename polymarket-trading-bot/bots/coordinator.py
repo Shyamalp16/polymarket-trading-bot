@@ -80,8 +80,8 @@ class CoordinatorConfig:
     buffer_allocation: float = 0.20  # 20%
     
     # Per-window limits
-    max_entries_per_window: int = 3
-    entry_cooldown: int = 30  # seconds between entries
+    max_entries_per_window: int = 2   # P1-8: strategy says 2 total per window
+    entry_cooldown: int = 60          # P1-9: 60s cooldown (strategy spec)
     cumulative_loss_budget_pct: float = 0.10  # 10% max loss per window
     
     # Conflict resolution
@@ -110,6 +110,7 @@ class WindowState:
     losses: float = 0.0
     momentum_entries: int = 0
     mr_entries: int = 0
+    total_entries: int = 0  # P1-8: shared cap across both bots
     last_momentum_entry: float = 0
     last_mr_entry: float = 0
     momentum_had_position: bool = False  # Track if position was held this window
@@ -150,7 +151,13 @@ class Coordinator:
         
         # Recent entry requests for conflict detection
         self._recent_requests: List[EntryRequest] = []
-        
+
+        # Late window gate (P2-8)
+        self._in_late_window: bool = False
+
+        # Window reset tracking via token_id (P2-11)
+        self._last_token_id_up: str = ""
+
         # Running state
         self._running = False
     
@@ -211,13 +218,6 @@ class Coordinator:
         
         if momentum_signal:
             logger.info(f"==> MOMENTUM SIGNAL: {momentum_signal.side.value.upper()} | conf={momentum_signal.confidence:.0%} | {momentum_signal.reason}")
-        else:
-            # Log why no momentum signal
-            if not self.momentum.has_position:
-                mkt = self.state.get_market_data()
-                rsp = self.state.get_risk_metrics()
-                spot = self.state.get_spot_change(2)
-                logger.debug(f"No momentum: spot={spot*100:.3f}% time={mkt.time_to_expiry}s vpin={rsp.vpin:.2f}")
         
         # Check if we're in impulse priority window
         in_impulse_window = await self._is_in_impulse_window()
@@ -233,11 +233,14 @@ class Coordinator:
         if mr_signal:
             logger.info(f"==> MR SIGNAL: {mr_signal.side.value.upper()} | conf={mr_signal.confidence:.0%} | {mr_signal.reason}")
         
-        # Check if ANY bot already has a position - block ALL new entries if so
-        if self.momentum.has_position or self.mean_reversion.has_position:
-            logger.debug("Coordinator: blocking entry - position already open")
+        # P2-8: block new entries during late window (mercy stops still handled per-bot)
+        if self._in_late_window:
+            logger.debug("Coordinator: blocking entry — late window")
             return None
-        
+
+        # P1-1: DO NOT block both bots when only one has a position.
+        # Each bot has its own capital pool; _approve_* checks has_position per-bot.
+
         # Resolve conflicts
         if momentum_signal and mr_signal:
             return await self._resolve_conflict(momentum_signal, mr_signal, risk)
@@ -249,31 +252,26 @@ class Coordinator:
         return None
     
     async def _check_window_reset(self):
-        """Check if we need to reset for new market window."""
+        """Check if we need to reset for a new market window.
+
+        P2-11: use token_id change as the authoritative signal instead of
+        inferring from a time_to_expiry jump (which can be ambiguous).
+        """
         market = self.state.get_market_data()
-        
-        # Check if we have valid market data
+
         if not market or not market.token_id_up:
             return
-        
-        # Track previous time for window detection
-        if not hasattr(self, '_last_time_to_expiry'):
-            self._last_time_to_expiry = market.time_to_expiry
-        
-        current_time = market.time_to_expiry
-        
-        # If time remaining jumped significantly (new market), reset window
-        # Or if time went from very low to high (market reset)
-        if self._window and current_time > self._last_time_to_expiry + 60:
-            # New market window
+
+        if self._window and self._last_token_id_up and market.token_id_up != self._last_token_id_up:
+            # Genuine new market — token IDs changed
             self._window_start = time.time()
             self._window = WindowState(start_time=self._window_start)
+            self._in_late_window = False
             self.momentum.reset_daily_stats()
             self.mean_reversion.reset_daily_stats()
-            logger.info(f"=== NEW MARKET STARTED (time: {current_time}s) ===")
-            logger.info(f"Coordinator: new market window started (time: {current_time}s)")
-        
-        self._last_time_to_expiry = current_time
+            logger.info(f"=== NEW MARKET: {self._last_token_id_up[:8]}... → {market.token_id_up[:8]}... ===")
+
+        self._last_token_id_up = market.token_id_up
     
     async def _is_in_impulse_window(self) -> bool:
         """Check if we're in the momentum impulse priority window."""
@@ -340,49 +338,48 @@ class Coordinator:
     
     async def _approve_momentum(self, signal, risk) -> Optional[Dict[str, Any]]:
         """Approve momentum entry with checks."""
-        
-        # Check if already has position
+
+        # Check if already has position (per-bot check — P1-1 removes the shared gate)
         if self.momentum.has_position:
             logger.debug("Momentum: already has position")
             return None
-        
-        # Check per-window limit
-        if self._window and self._window.momentum_entries >= self.config.max_entries_per_window:
-            logger.debug("Momentum: max entries per window reached")
+
+        # P1-8: enforce shared total_entries cap (strategy: 2 total per window)
+        if self._window and self._window.total_entries >= self.config.max_entries_per_window:
+            logger.debug("Momentum: shared entry cap reached (%d)", self._window.total_entries)
             return None
-        
+
+        # Per-bot entry limit (extra guard)
+        if self._window and self._window.momentum_entries >= self.config.max_entries_per_window:
+            logger.debug("Momentum: per-bot max entries reached")
+            return None
+
         # Check cooldown
         if self._window:
             elapsed = time.time() - self._window.last_momentum_entry
             if elapsed < self.config.entry_cooldown:
-                logger.debug("Momentum: cooldown active")
+                logger.debug("Momentum: cooldown active (%.0fs remaining)", self.config.entry_cooldown - elapsed)
                 return None
-        
+
         # Check loss budget
         if self._window and self._window.losses > self.config.cumulative_loss_budget_pct * self._momentum_capital:
             logger.debug("Momentum: loss budget exceeded")
             return None
-        
-        # Adjust size for VPIN
+
+        # P1-7: compute VPIN-adjusted size and pass to execute() as size_override
         original_size = self.momentum.calculate_size(signal)
-        
-        if risk.vpin > 0.5:
-            # Reduce size
-            size = original_size * self.config.vpin_reduce_momentum
-        else:
-            size = original_size
-        
-        # Check capital (minimum 5 shares)
+        size = original_size * self.config.vpin_reduce_momentum if risk.vpin > 0.5 else original_size
+
         if size < 5.0:
             return None
-        
-        # Execute
-        result = await self.momentum.execute(signal)
-        
+
+        # Execute with size override
+        result = await self.momentum.execute(signal, size_override=size)
+
         if result.get("success"):
-            # Update window state
             if self._window:
                 self._window.momentum_entries += 1
+                self._window.total_entries += 1  # P1-8
                 self._window.last_momentum_entry = time.time()
                 self._window.momentum_had_position = True
                 self._window.entries.append({
@@ -390,57 +387,60 @@ class Coordinator:
                     "side": signal.side.value,
                     "time": time.time(),
                 })
-        
+
         return result
     
     async def _approve_mean_reversion(self, signal, risk, in_impulse_window: bool) -> Optional[Dict[str, Any]]:
         """Approve mean reversion entry with checks."""
-        
-        # Check if already has position
+
+        # Check if already has position (per-bot check — P1-1 removes shared gate)
         if self.mean_reversion.has_position:
             logger.debug("MR: already has position")
             return None
-        
-        # Block in impulse window unless maker
+
+        # Block in impulse window unless maker price is sufficiently inside mid
         if in_impulse_window:
-            # Check if we can be maker at offset
             market = self.state.get_market_data()
             mid = market.mid_price
-            
-            if signal.side.value == "up":
-                maker_price = mid - self.config.mr_maker_offset_ticks
-            else:
-                maker_price = mid + self.config.mr_maker_offset_ticks
-            
-            # If current price is not at least 3 ticks inside, block
+            maker_price = mid - self.config.mr_maker_offset_ticks if signal.side.value == "up" else mid + self.config.mr_maker_offset_ticks
             if signal.entry_price > maker_price:
                 logger.debug("MR: blocked during impulse window (not maker)")
                 return None
-        
-        # Check per-window limit
-        if self._window and self._window.mr_entries >= self.config.max_entries_per_window:
-            logger.debug("MR: max entries per window reached")
+
+        # P1-8: enforce shared total_entries cap
+        if self._window and self._window.total_entries >= self.config.max_entries_per_window:
+            logger.debug("MR: shared entry cap reached (%d)", self._window.total_entries)
             return None
-        
+
+        if self._window and self._window.mr_entries >= self.config.max_entries_per_window:
+            logger.debug("MR: per-bot max entries reached")
+            return None
+
         # Check cooldown
         if self._window:
             elapsed = time.time() - self._window.last_mr_entry
             if elapsed < self.config.entry_cooldown:
-                logger.debug("MR: cooldown active")
+                logger.debug("MR: cooldown active (%.0fs remaining)", self.config.entry_cooldown - elapsed)
                 return None
-        
+
         # Check loss budget
         if self._window and self._window.losses > self.config.cumulative_loss_budget_pct * self._mr_capital:
             logger.debug("MR: loss budget exceeded")
             return None
-        
-        # Execute
-        result = await self.mean_reversion.execute(signal)
-        
+
+        # P1-7: pass VPIN-adjusted size to execute()
+        original_size = self.mean_reversion.calculate_size(signal)
+        size = original_size * self.config.vpin_reduce_momentum if risk.vpin > 0.5 else original_size
+
+        if size < 5.0:
+            return None
+
+        result = await self.mean_reversion.execute(signal, size_override=size)
+
         if result.get("success"):
-            # Update window state
             if self._window:
                 self._window.mr_entries += 1
+                self._window.total_entries += 1  # P1-8
                 self._window.last_mr_entry = time.time()
                 self._window.mr_had_position = True
                 self._window.entries.append({
@@ -448,16 +448,25 @@ class Coordinator:
                     "side": signal.side.value,
                     "time": time.time(),
                 })
-        
+
         return result
     
     async def check_exits(self):
-        """Check both bots for exit conditions."""
+        """Check both bots for exit conditions and MR maker escalation."""
         # Check momentum exits
         momentum_exit = await self.momentum.check_exit()
         if momentum_exit:
             await self._handle_exit(BotType.MOMENTUM, momentum_exit)
-        
+
+        # Check MR maker escalation (pending GTX order may need improvement or taker fill)
+        mr_escalation = await self.mean_reversion.check_maker_escalation()
+        if mr_escalation and mr_escalation.get("success"):
+            if self._window and not mr_escalation.get("pending_maker"):
+                self._window.mr_entries += 1
+                self._window.total_entries += 1
+                self._window.last_mr_entry = time.time()
+                self._window.mr_had_position = True
+
         # Check MR exits
         mr_exit = await self.mean_reversion.check_exit()
         if mr_exit:
@@ -465,35 +474,60 @@ class Coordinator:
     
     async def _handle_exit(self, bot_type: BotType, exit_data: Dict[str, Any]):
         """Handle exit from a bot."""
-        
+
         action = exit_data.get("action")
         size = exit_data.get("size", 0)
         reason = exit_data.get("reason", "")
-        
+
         if action == "sell":
-            if bot_type == BotType.MOMENTUM:
-                result = await self.momentum.close_position(reason, sell_size=size)
-            else:
-                result = await self.mean_reversion.close_position(reason, sell_size=size)
-            
-            # Track PnL
+            bot = self.momentum if bot_type == BotType.MOMENTUM else self.mean_reversion
+            had_position_before = bot.has_position
+
+            result = await bot.close_position(reason, sell_size=size)
+
             if result.get("success"):
                 pnl = result.get("pnl", 0)
-                if self._window:
-                    if pnl < 0:
-                        self._window.losses += abs(pnl)
-                
+                if self._window and pnl < 0:
+                    self._window.losses += abs(pnl)
                 logger.info(f"Exit: {bot_type.value} {reason} PnL: ${pnl:.2f}")
+
+            elif had_position_before and not bot.has_position:
+                # P2-9: position was force-cleared — record an estimated loss
+                entry_price = (
+                    self.momentum.position.entry_price if bot_type == BotType.MOMENTUM and self.momentum.position
+                    else self.mean_reversion.position.entry_price if self.mean_reversion.position
+                    else 0.0
+                )
+                if entry_price > 0 and self._window:
+                    mercy_pct = 0.30  # conservative floor
+                    estimated_loss = entry_price * size * mercy_pct
+                    self._window.losses += estimated_loss
+                    logger.warning(
+                        f"Exit: {bot_type.value} {reason} FORCE-CLEARED — estimated loss ${estimated_loss:.2f}"
+                    )
     
     async def check_late_window(self):
-        """Check if we're in late window - hold to expiry unless mercy."""
+        """Update the late-window gate (P2-8).
+
+        When <15% of window time remains, set _in_late_window = True.
+        This blocks new entries in check_and_coordinate(). Existing positions
+        ride to expiry — mercy stops are still enforced inside each bot's
+        check_exit().
+        """
         market = self.state.get_market_data()
-        time_pct = market.time_to_expiry / 300  # 5 min = 300s
-        
-        if time_pct < self.config.late_window_threshold:
-            # Late window - don't initiate new exits, let positions ride
-            # Unless mercy stop
-            pass
+        if market.time_to_expiry <= 0:
+            return
+
+        time_pct = market.time_to_expiry / 300  # assumes 5-minute window
+        was_late = self._in_late_window
+        self._in_late_window = time_pct < self.config.late_window_threshold
+
+        if self._in_late_window and not was_late:
+            logger.info(
+                "Coordinator: entering late window (%.0fs remaining, %.0f%% of window)",
+                market.time_to_expiry,
+                time_pct * 100,
+            )
     
     def get_status(self) -> Dict[str, Any]:
         """Get coordinator status."""

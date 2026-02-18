@@ -68,12 +68,24 @@ class BTCPriceTracker:
     
     async def _poll_loop(self):
         """Poll for price updates."""
+        _consecutive_failures = 0
         while self._running:
             try:
                 await self._fetch_price()
+                _consecutive_failures = 0
             except Exception as e:
-                logger.debug(f"Price fetch error: {e}")
-            
+                _consecutive_failures += 1
+                # Surface at WARNING after 3 consecutive failures so it's visible
+                # in the default INFO log level (not buried at DEBUG).
+                if _consecutive_failures >= 3:
+                    logger.warning(
+                        "BTC price feed: %d consecutive failures — spot_change will be 0, "
+                        "momentum bot will not fire. Last error: %s",
+                        _consecutive_failures, e,
+                    )
+                else:
+                    logger.debug(f"Price fetch error: {e}")
+
             await asyncio.sleep(self.poll_interval)
     
     async def _fetch_price(self):

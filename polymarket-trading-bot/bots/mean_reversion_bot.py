@@ -37,7 +37,7 @@ import logging
 import time
 import statistics
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List, Deque
+from typing import Optional, Dict, Any, Deque
 from collections import deque
 from enum import Enum
 
@@ -87,15 +87,15 @@ class MeanReversionConfig:
     max_position_pct: float = 0.05
     kelly_multiplier: float = 0.20
     
-    # Flash detection
-    min_drop: float = 0.05          # 5% drop triggers (lowered for more signals)
+    # Flash detection (P1-5: aligned with strategy spec)
+    min_drop: float = 0.10          # 10% drop threshold
     min_drop_window: int = 8        # seconds
-    z_threshold: float = 1.5         # Z-score threshold (lowered further)
+    z_threshold: float = 2.5        # Z-score threshold (strategy spec: 2.5)
     z_window: int = 60              # seconds for z-score
-    
+
     # Dynamic thresholds by regime
-    high_vol_drop: float = 0.08     # Higher threshold in high vol
-    low_vol_drop: float = 0.04      # Lower threshold in low vol
+    high_vol_drop: float = 0.12     # 12% in high vol (strategy spec)
+    low_vol_drop: float = 0.08      # 8% in low vol (strategy spec)
     
     # Cause filter
     cause_filter_threshold: float = 0.0025  # 0.25% spot move blocks
@@ -144,6 +144,12 @@ class MeanReversionPosition:
     sl_price: float = 0.0
     tp1_filled: bool = False
     tp2_filled: bool = False
+    # Limit orders for automated exits
+    sl_order_id: Optional[str] = None
+    tp1_order_id: Optional[str] = None
+    tp2_order_id: Optional[str] = None
+    # Throttle: last time we polled order status via HTTP (P2-1)
+    _last_order_poll: float = 0.0
 
 
 class MeanReversionBot:
@@ -169,14 +175,18 @@ class MeanReversionBot:
         self._last_entry_time: float = 0
         self._balance_block_until: float = 0  # Cooldown after balance errors
         self._failed_close_attempts: int = 0  # Track failed close attempts
-        
+
         # Price history for z-score
         self._price_history: Deque = deque(maxlen=120)  # 2 min at 1s
-        
-        # Maker order tracking
+
+        # P3-4: per-side price history as explicit typed attributes (not dynamic hasattr)
+        self._side_history_up: Deque = deque(maxlen=120)
+        self._side_history_down: Deque = deque(maxlen=120)
+
+        # Maker order tracking (P1-2: two-phase maker-first execution)
         self._pending_maker_order: Optional[Dict] = None
         self._maker_order_time: float = 0
-        
+
         # Metrics
         self._entries_today: int = 0
         self._wins_today: int = 0
@@ -258,99 +268,83 @@ class MeanReversionBot:
         risk,
     ) -> Optional[ReversionSignal]:
         """Check for reversion signal on specific side."""
-        
-        # Track price for this side
-        if not hasattr(self, f'_side_history_{side.value}'):
-            setattr(self, f'_side_history_{side.value}', deque(maxlen=120))
-        
-        history: Deque = getattr(self, f'_side_history_{side.value}')
-        history.append({
-            'price': current_price,
-            'timestamp': time.time()
-        })
-        
+
+        # P3-4: use explicit typed deques instead of dynamic hasattr/setattr
+        history: Deque = self._side_history_up if side == ReversionSide.UP else self._side_history_down
+        history.append({'price': current_price, 'timestamp': time.time()})
+
         if len(history) < 5:
             return None
-        
-        # Calculate drop in window
+
+        # Calculate peak-to-trough drop within the detection window
         now = time.time()
         window_prices = [
             h['price'] for h in history
             if now - h['timestamp'] <= self.config.min_drop_window
         ]
-        
+
         if len(window_prices) < 3:
             return None
-        
+
         peak = max(window_prices)
         trough = min(window_prices)
-        
-        if side == ReversionSide.UP:
-            # Price dropped, looking for bounce
-            drop = (peak - trough) / peak if peak > 0 else 0
-            expected_direction = "down"  # Spot should have gone down
-        else:
-            # Price spiked, looking for dump
-            drop = (peak - trough) / peak if peak > 0 else 0
-            expected_direction = "up"  # Spot should have gone up
-        
-        # Check drop threshold
+        drop = (peak - trough) / peak if peak > 0 else 0
+
         if drop < min_drop:
             logger.debug(f"MR {side.value}: drop {drop*100:.1f}% < threshold {min_drop*100:.1f}%")
             return None
-        
-        # Cause filter: check if spot moved same direction
-        spot_change = abs(self.state.get_spot_change(self.config.min_drop_window))
-        if spot_change > self.config.cause_filter_threshold:
-            # Informed flow - suppress
-            logger.debug("MR: suppressed due to spot flow %.4f", spot_change)
+
+        # P3-3: directional cause filter — only suppress when spot moved in the SAME
+        # direction as the Poly move (informed flow). Opposing spot move is healthy.
+        spot_change_signed = self.state.get_spot_change(self.config.min_drop_window)
+        if side == ReversionSide.UP and spot_change_signed < -self.config.cause_filter_threshold:
+            # Spot also went down sharply — informed sellers, not a dislocation
+            logger.debug("MR UP: suppressed — informed spot down %.4f", spot_change_signed)
             return None
-        
+        if side == ReversionSide.DOWN and spot_change_signed > self.config.cause_filter_threshold:
+            # Spot also went up sharply — informed buyers, not a dislocation
+            logger.debug("MR DOWN: suppressed — informed spot up %.4f", spot_change_signed)
+            return None
+
         # Calculate z-score
         prices = [h['price'] for h in history if now - h['timestamp'] <= self.config.z_window]
         if len(prices) < 10:
-            z_score = 0
+            z_score = 0.0
         else:
             mean = statistics.mean(prices)
             stdev = statistics.stdev(prices) if len(prices) > 1 else 0.001
-            z_score = abs((current_price - mean) / stdev) if stdev > 0 else 0
-        
+            z_score = abs((current_price - mean) / stdev) if stdev > 0 else 0.0
+
         if z_score < self.config.z_threshold:
             logger.debug(f"MR {side.value}: z={z_score:.1f} < {self.config.z_threshold}")
             return None
-        
-        # OB confirmation
+
+        # P1-6: OB confirmation — both sides use (1 - imbalance).
+        # imbalance = ask_depth / total_depth on the UP token.
+        # Lower imbalance = more bids = buyers present = price support.
+        # This is valid for BOTH UP (buy the dip) and DOWN reversion (UP spike
+        # exhausting = sellers overwhelming bids on UP token = DOWN token recovering).
         imbalance = self.state.get_imbalance()
-        
-        # For UP reversion (buy dip), we want ask imbalance (sells getting exhausted)
-        # For DOWN reversion (sell rip), we want bid imbalance (buys getting exhausted)
-        if side == ReversionSide.UP:
-            # Want: more bids than asks at lower prices = buyers stepping in
-            ob_support = 1 - imbalance
-        else:
-            ob_support = imbalance
-        
+        ob_support = 1 - imbalance
+
         if ob_support < self.config.ob_imbalance_threshold:
             logger.debug(f"MR {side.value}: ob={ob_support:.2f} < {self.config.ob_imbalance_threshold}")
             return None
-        
+
         # Calculate confidence
         drop_strength = min(1.0, drop / (min_drop * 2))
         z_strength = min(1.0, z_score / (self.config.z_threshold * 2))
         ob_strength = min(1.0, ob_support / 0.9)
-        
-        # Reduce for VPIN
         vpin_factor = max(0.3, 1 - risk.vpin)
-        
+
         confidence = (drop_strength * 0.3 + z_strength * 0.3 + ob_strength * 0.4) * vpin_factor
-        
+
         if confidence < self.config.min_signal_strength:
             logger.debug(f"MR {side.value}: conf={confidence:.2f} < {self.config.min_signal_strength}")
             return None
-        
-        # Get market data
+
         market = self.state.get_market_data()
-        
+
         return ReversionSignal(
             side=side,
             confidence=confidence,
@@ -377,65 +371,95 @@ class MeanReversionBot:
         
         return round(size_shares, 2)
     
-    async def execute(self, signal: ReversionSignal) -> Dict[str, Any]:
-        """Execute mean reversion entry."""
-        # Check balance block cooldown
+    async def execute(self, signal: ReversionSignal, size_override: Optional[float] = None) -> Dict[str, Any]:
+        """Execute mean reversion entry using maker-first, taker-escalation approach (P1-2).
+
+        Phase 1: Post GTX (post-only) at maker_price.
+        Phase 2: If drop exceeds taker_escalation_threshold and OB still confirms,
+                 cancel maker and submit FOK (handled by check_maker_escalation()).
+
+        Args:
+            signal: Entry signal.
+            size_override: VPIN-adjusted size from coordinator (P1-7).
+        """
         if time.time() < self._balance_block_until:
             logger.debug("MR: blocked by balance cooldown")
             return {"success": False, "reason": "balance cooldown"}
-        
-        size = self.calculate_size(signal)
-        
+
+        size = size_override if size_override is not None else self.calculate_size(signal)
+
         if size < 5.0:
             return {"success": False, "reason": "size too small"}
-        
+
         market = self.state.get_market_data()
-        
-        # Determine token and price
+
         if signal.side == ReversionSide.UP:
             token_id = market.token_id_up
             side = "BUY"
-            mid = market.mid_price
-            # Post at mid - offset
-            maker_price = mid - self.config.maker_spread_offset
+            maker_price = max(0.01, min(0.99, market.mid_price - self.config.maker_spread_offset))
         else:
             token_id = market.token_id_down
             side = "BUY"
-            mid = market.mid_price
-            maker_price = mid + self.config.maker_spread_offset
-        
-        maker_price = max(0.01, min(0.99, maker_price))
-        
-        # Determine window for SL
+            maker_price = max(0.01, min(0.99, market.mid_price + self.config.maker_spread_offset))
+
         window_remaining = market.time_to_expiry
-        
-        if window_remaining > 180:  # Early window (>60%)
-            sl_pct = self.config.early_sl_pct
-        else:  # Mid window
-            sl_pct = self.config.mid_sl_pct
-        
-        # Calculate exits
-        if signal.side == ReversionSide.UP:
-            entry = maker_price
-            tp1 = entry * (1 + self.config.tp1_pct)
-            tp2 = entry * (1 + self.config.tp2_pct)
-            sl = entry * (1 - sl_pct)
-        else:
-            entry = maker_price
-            tp1 = entry * (1 + self.config.tp1_pct)
-            tp2 = entry * (1 + self.config.tp2_pct)
-            sl = entry * (1 - sl_pct)
-        
-        # Use FOK with retries - wait for liquidity
-        max_retries = 5
+        sl_pct = self.config.early_sl_pct if window_remaining > 180 else self.config.mid_sl_pct
+
+        # Phase 1: attempt post-only (GTX) maker order
+        try:
+            maker_result = await self.bot.place_order(
+                token_id=token_id,
+                price=round(maker_price, 4),
+                size=size,
+                side=side,
+                order_type="GTX",
+            )
+
+            if maker_result.success:
+                # Maker order resting — store for escalation check
+                self._pending_maker_order = {
+                    "order_id": maker_result.order_id,
+                    "token_id": token_id,
+                    "side": side,
+                    "size": size,
+                    "price": maker_price,
+                    "signal": signal,
+                    "sl_pct": sl_pct,
+                    "window_remaining": window_remaining,
+                }
+                self._maker_order_time = time.time()
+                logger.info(
+                    f"==> MR MAKER POSTED: {signal.side.value.upper()} | {size:.2f} shares @ {maker_price:.3f} | "
+                    f"waiting for fill (escalation in {self.config.maker_improve_wait:.0f}s)"
+                )
+                return {"success": True, "pending_maker": True, "reason": "maker_posted"}
+
+            # GTX rejected (e.g. would cross spread) — escalate directly to taker
+            logger.info("MR: GTX rejected (%s), escalating to FOK taker", maker_result.message)
+
+        except Exception as e:
+            logger.error("MR: maker order failed: %s", e)
+
+        # Phase 2 fallback: taker FOK
+        return await self._execute_taker(signal, token_id, side, size, sl_pct, window_remaining)
+
+    async def _execute_taker(
+        self,
+        signal: ReversionSignal,
+        token_id: str,
+        side: str,
+        size: float,
+        sl_pct: float,
+        window_remaining: int,
+    ) -> Dict[str, Any]:
+        """Submit a FOK taker order and record the position on fill."""
+        max_retries = 3
         for attempt in range(max_retries):
-            # Refresh market data on each retry - prices may have changed
             market = self.state.get_market_data()
-            
+            exec_price = round(
+                market.up_price if signal.side == ReversionSide.UP else market.down_price, 4
+            )
             try:
-                # Use current market price for immediate fill
-                exec_price = round(market.up_price if signal.side == ReversionSide.UP else market.down_price, 4)
-                
                 result = await self.bot.place_order(
                     token_id=token_id,
                     price=exec_price,
@@ -443,84 +467,369 @@ class MeanReversionBot:
                     side=side,
                     order_type="FOK",
                 )
-                
-                if result.success:
-                    actual_entry = exec_price
-                    
-                    # Record position
-                    self._position = MeanReversionPosition(
-                        side=signal.side,
-                        entry_price=actual_entry,  # Use actual fill price, not intended price
-                        size=size,
-                        entry_time=time.time(),
-                        window_start=window_remaining,
-                        sl_price=actual_entry * (1 - sl_pct),  # Recalculate SL based on actual entry
-                    )
 
-                    self._last_entry_time = time.time()
-                    self._entries_today += 1
-                    
-                    # Recalculate TP based on actual entry price
-                    if signal.side == ReversionSide.UP:
-                        tp1_actual = actual_entry * (1 + self.config.tp1_pct)
-                        tp2_actual = actual_entry * (1 + self.config.tp2_pct)
-                    else:
-                        tp1_actual = actual_entry * (1 + self.config.tp1_pct)
-                        tp2_actual = actual_entry * (1 + self.config.tp2_pct)
-                    sl_actual = actual_entry * (1 - sl_pct)
-                    
-                    logger.info(
-                        f"==> MR ENTERED: {signal.side.value.upper()} | ${size:.2f} @ {actual_entry:.3f} | "
-                        f"TP1: {tp1_actual:.3f} TP2: {tp2_actual:.3f} SL: {sl_actual:.3f}"
-                    )
-                    
-                    return {
-                        "success": True,
-                        "position": self._position,
-                        "exits": ReversionExit(
-                            tp1_price=tp1_actual,
-                            tp2_price=tp2_actual,
-                            initial_sl=sl_actual,
-                            early_sl_pct=self.config.early_sl_pct,
-                            mid_sl_pct=self.config.mid_sl_pct,
-                            mercy_sl_pct=self.config.mercy_sl_pct,
-                        ),
-                    }
-                
-                # Check error type
-                is_balance_error = result.message and ("balance" in result.message.lower() or "allowance" in result.message.lower())
-                
-                # Check if FOK couldn't fill (no liquidity)
-                is_fok_error = result.message and ("couldn't be fully filled" in result.message.lower() or "not enough liquidity" in result.message.lower())
-                
+                if result.success:
+                    return self._record_fill(signal, exec_price, size, sl_pct, window_remaining)
+
+                is_balance_error = result.message and (
+                    "balance" in result.message.lower() or "allowance" in result.message.lower()
+                )
+                is_fok_error = result.message and (
+                    "couldn't be fully filled" in result.message.lower()
+                    or "not enough liquidity" in result.message.lower()
+                )
+
                 if is_balance_error:
                     if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt  # 1s, 2s, 4s
-                        logger.warning("MR: balance error, retry %d/%d in %ds", attempt + 1, max_retries, wait_time)
-                        await asyncio.sleep(wait_time)
+                        await asyncio.sleep(2 ** attempt)
                         continue
-                    else:
-                        self._balance_block_until = time.time() + 10
-                        logger.warning("MR: balance error on entry, blocking 10s")
-                
-                # FOK failed - wait and retry
-                if is_fok_error:
-                    if attempt < max_retries - 1:
-                        wait_time = 1 + attempt * 0.5  # 1s, 1.5s, 2s, 2.5s
-                        logger.info("MR: FOK couldn't fill, retry %d/%d in %ss", attempt + 1, max_retries, wait_time)
-                        await asyncio.sleep(wait_time)
-                        continue
-                
+                    self._balance_block_until = time.time() + 10
+                    logger.warning("MR: balance error on taker entry, blocking 10s")
+
+                if is_fok_error and attempt < max_retries - 1:
+                    await asyncio.sleep(1 + attempt * 0.5)
+                    continue
+
                 return {"success": False, "reason": result.message}
-                
+
             except Exception as e:
-                logger.error("MeanReversion execution failed: %s", e)
+                logger.error("MR taker execution failed: %s", e)
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
                     continue
                 return {"success": False, "reason": str(e)}
-        
+
         return {"success": False, "reason": "max retries exceeded"}
+
+    def _record_fill(
+        self,
+        signal: ReversionSignal,
+        actual_entry: float,
+        size: float,
+        sl_pct: float,
+        window_remaining: int,
+    ) -> Dict[str, Any]:
+        """Record a confirmed fill and schedule exit order placement."""
+        tp1_actual = actual_entry * (1 + self.config.tp1_pct)
+        tp2_actual = actual_entry * (1 + self.config.tp2_pct)
+        sl_actual = actual_entry * (1 - sl_pct)
+
+        self._position = MeanReversionPosition(
+            side=signal.side,
+            entry_price=actual_entry,
+            size=size,
+            entry_time=time.time(),
+            window_start=window_remaining,
+            sl_price=sl_actual,
+        )
+
+        self._last_entry_time = time.time()
+        self._entries_today += 1
+        self._pending_maker_order = None  # Clear any pending maker state
+
+        exits_obj = ReversionExit(
+            tp1_price=tp1_actual,
+            tp2_price=tp2_actual,
+            initial_sl=sl_actual,
+            early_sl_pct=self.config.early_sl_pct,
+            mid_sl_pct=self.config.mid_sl_pct,
+            mercy_sl_pct=self.config.mercy_sl_pct,
+        )
+
+        # P2-2: schedule exit orders as background task — do NOT sleep here
+        asyncio.create_task(self._place_exit_limit_orders(self._position, exits_obj))
+
+        logger.info(
+            f"==> MR ENTERED: {signal.side.value.upper()} | ${size:.2f} @ {actual_entry:.3f} | "
+            f"TP1: {tp1_actual:.3f} TP2: {tp2_actual:.3f} SL: {sl_actual:.3f}"
+        )
+
+        return {"success": True, "position": self._position, "exits": exits_obj}
+
+    async def check_maker_escalation(self) -> Optional[Dict[str, Any]]:
+        """Check pending maker order — improve price or escalate to taker (P1-2).
+
+        Called from the coordination loop alongside check_exit().
+        """
+        if not self._pending_maker_order or self.has_position:
+            return None
+
+        order = self._pending_maker_order
+        elapsed = time.time() - self._maker_order_time
+
+        clob = self.bot.clob_client
+
+        # Check if the maker order already filled
+        try:
+            status = await self.bot._run_in_thread(clob.get_order, order["order_id"])
+            if status.get("status") == "filled":
+                filled_size = float(status.get("size_matched", status.get("size", 0)))
+                signal = order["signal"]
+                logger.info(f"MR: maker order filled {filled_size} shares")
+                return self._record_fill(
+                    signal, order["price"], filled_size, order["sl_pct"], order["window_remaining"]
+                )
+        except Exception as e:
+            logger.debug(f"MR: error polling maker order: {e}")
+
+        # Not filled yet — check if we should improve or escalate
+        if elapsed < self.config.maker_improve_wait:
+            return None  # Still waiting
+
+        # Try improving by 1 tick first (one improvement attempt only)
+        if elapsed < self.config.maker_improve_wait * 2:
+            signal = order["signal"]
+            improved_price = round(order["price"] + 0.01, 4) if signal.side == ReversionSide.UP else round(order["price"] - 0.01, 4)
+            improved_price = max(0.01, min(0.99, improved_price))
+            try:
+                await self.bot._run_in_thread(clob.cancel_order, order["order_id"])
+                improved = await self.bot.place_order(
+                    token_id=order["token_id"],
+                    price=improved_price,
+                    size=order["size"],
+                    side=order["side"],
+                    order_type="GTX",
+                )
+                if improved.success:
+                    self._pending_maker_order["order_id"] = improved.order_id
+                    self._pending_maker_order["price"] = improved_price
+                    self._maker_order_time = time.time()  # Reset timer for second wait
+                    logger.info(f"MR: improved maker order to {improved_price:.3f}")
+                    return None
+            except Exception as e:
+                logger.debug(f"MR: maker improve failed: {e}")
+
+        # Escalate to taker: check if drop now exceeds escalation threshold and OB confirms
+        signal = order["signal"]
+        market = self.state.get_market_data()
+        risk = self.state.get_risk_metrics()
+
+        min_drop = self.config.min_drop
+        if risk.regime.value == "high":
+            min_drop = self.config.high_vol_drop
+        elif risk.regime.value == "low":
+            min_drop = self.config.low_vol_drop
+
+        history: Deque = self._side_history_up if signal.side == ReversionSide.UP else self._side_history_down
+        now = time.time()
+        window_prices = [h['price'] for h in history if now - h['timestamp'] <= self.config.min_drop_window]
+        if window_prices:
+            peak = max(window_prices)
+            trough = min(window_prices)
+            current_drop = (peak - trough) / peak if peak > 0 else 0
+            imbalance = self.state.get_imbalance()
+            ob_support = 1 - imbalance
+
+            if current_drop >= min_drop * self.config.taker_escalation_threshold and ob_support >= self.config.ob_imbalance_threshold:
+                # Cancel maker and escalate to taker
+                try:
+                    await self.bot._run_in_thread(clob.cancel_order, order["order_id"])
+                except Exception:
+                    pass
+                self._pending_maker_order = None
+                logger.info(f"MR: escalating to taker (drop {current_drop*100:.1f}% ≥ {min_drop*self.config.taker_escalation_threshold*100:.1f}%)")
+                sl_pct = order["sl_pct"]
+                window_remaining = order["window_remaining"]
+                return await self._execute_taker(signal, order["token_id"], order["side"], order["size"], sl_pct, window_remaining)
+
+        # Drop not sufficient for escalation — cancel and give up
+        try:
+            await self.bot._run_in_thread(clob.cancel_order, order["order_id"])
+        except Exception:
+            pass
+        self._pending_maker_order = None
+        logger.info("MR: maker order expired, no escalation (drop insufficient)")
+        return None
+    
+    async def _cancel_all_exit_orders(self, pos: MeanReversionPosition):
+        """Cancel all live exit limit orders for a position (P0-5)."""
+        clob = self.bot.clob_client
+        for oid in [pos.sl_order_id, pos.tp1_order_id, pos.tp2_order_id]:
+            if oid:
+                try:
+                    await self.bot._run_in_thread(clob.cancel_order, oid)
+                    logger.info(f"MR: cancelled exit order {oid}")
+                except Exception as e:
+                    logger.debug(f"MR: could not cancel order {oid}: {e}")
+
+    async def _place_exit_limit_orders(self, pos: MeanReversionPosition, exits: ReversionExit):
+        """Place GTC limit orders for SL and TPs concurrently after entry (P0-3, P2-5)."""
+        try:
+            market = self.state.get_market_data()
+            token_id = market.token_id_up if pos.side == ReversionSide.UP else market.token_id_down
+            side = "SELL"
+
+            sl_price_r = round(pos.sl_price, 4)
+            tp1_price_r = round(pos.entry_price * (1 + self.config.tp1_pct + 0.01), 4)
+            tp2_price_r = round(pos.entry_price * (1 + self.config.tp2_pct + 0.01), 4)
+
+            logger.info(f"MR: placing exit orders for {pos.size} shares @ entry {pos.entry_price:.3f}")
+
+            # P0-3: SL covers 100% of position; TP1/TP2 cover 30% each (40% hold rides)
+            sl_result, tp1_result, tp2_result = await asyncio.gather(
+                self.bot.place_order(token_id=token_id, price=sl_price_r,  size=pos.size,        side=side, order_type="GTC"),
+                self.bot.place_order(token_id=token_id, price=tp1_price_r, size=pos.size * 0.30, side=side, order_type="GTC"),
+                self.bot.place_order(token_id=token_id, price=tp2_price_r, size=pos.size * 0.30, side=side, order_type="GTC"),
+                return_exceptions=True,
+            )
+
+            if not isinstance(sl_result, Exception) and sl_result.success:
+                pos.sl_order_id = sl_result.order_id
+                logger.info(f"MR: SL order {sl_result.order_id} @ {sl_price_r:.3f} (100%)")
+            else:
+                logger.warning(f"MR: SL order failed: {sl_result}")
+            if not isinstance(tp1_result, Exception) and tp1_result.success:
+                pos.tp1_order_id = tp1_result.order_id
+                logger.info(f"MR: TP1 order {tp1_result.order_id} @ {tp1_price_r:.3f} (30%)")
+            else:
+                logger.warning(f"MR: TP1 order failed: {tp1_result}")
+            if not isinstance(tp2_result, Exception) and tp2_result.success:
+                pos.tp2_order_id = tp2_result.order_id
+                logger.info(f"MR: TP2 order {tp2_result.order_id} @ {tp2_price_r:.3f} (30%)")
+            else:
+                logger.warning(f"MR: TP2 order failed: {tp2_result}")
+
+        except Exception as e:
+            logger.error(f"MR: failed to place exit limit orders: {e}", exc_info=True)
+    
+    async def _cancel_remaining_orders(self, pos: MeanReversionPosition, reason: str):
+        """Cancel remaining limit orders after one fills."""
+        clob = self.bot.clob_client
+        orders_to_cancel = []
+        
+        if reason == "SL":
+            # Cancel TPs if SL hit
+            orders_to_cancel = [pos.tp1_order_id, pos.tp2_order_id]
+        elif reason in ["TP1", "TP2"]:
+            # Cancel SL and other TP if one TP hit
+            orders_to_cancel = [pos.sl_order_id]
+            if reason == "TP1":
+                orders_to_cancel.append(pos.tp2_order_id)
+            elif reason == "TP2":
+                orders_to_cancel.append(pos.tp1_order_id)
+        
+        for order_id in orders_to_cancel:
+            if order_id:
+                try:
+                    await self.bot._run_in_thread(clob.cancel_order, order_id)
+                    logger.info(f"MR: cancelled {order_id} after {reason}")
+                except Exception as e:
+                    logger.debug(f"MR: failed to cancel order {order_id}: {e}")
+    
+    async def _check_limit_orders(self, pos: MeanReversionPosition) -> Optional[Dict[str, Any]]:
+        """Check if any limit orders have been filled.
+
+        Throttled to every 5 seconds (P2-1) to avoid flooding the REST API.
+        """
+        if not pos.sl_order_id and not pos.tp1_order_id and not pos.tp2_order_id:
+            return None
+
+        # P2-1: throttle HTTP polling to every 5 seconds
+        now = time.time()
+        if now - pos._last_order_poll < 5.0:
+            return None
+        pos._last_order_poll = now
+
+        try:
+            clob = self.bot.clob_client
+
+            # Check SL order
+            if pos.sl_order_id:
+                result = await self.bot._run_in_thread(clob.get_order, pos.sl_order_id)
+                if result.get("status") == "filled":
+                    filled_size = float(result.get("size", 0))
+                    if filled_size > 0:
+                        logger.info(f"MR: SL filled {filled_size} shares")
+                        oid = pos.sl_order_id
+                        pos.sl_order_id = None  # P0-4: clear immediately
+                        await self._cancel_remaining_orders(pos, "SL")
+                        return {"action": "sell", "size": filled_size, "reason": "SL", "order_id": oid}
+
+            # Check TP1 order — ratchet: sell 30%, new TP2 at config level, SL at break-even
+            if pos.tp1_order_id:
+                result = await self.bot._run_in_thread(clob.get_order, pos.tp1_order_id)
+                if result.get("status") == "filled":
+                    filled_size = float(result.get("size", 0))
+                    if filled_size > 0:
+                        pos.tp1_filled = True
+                        oid = pos.tp1_order_id
+                        pos.tp1_order_id = None  # P0-4: clear immediately
+                        logger.info(f"MR: TP1 filled {filled_size} shares")
+
+                        # Cancel old TP2 and SL before placing new ones
+                        if pos.tp2_order_id:
+                            try:
+                                await self.bot._run_in_thread(clob.cancel_order, pos.tp2_order_id)
+                                pos.tp2_order_id = None
+                            except Exception:
+                                pass
+                        if pos.sl_order_id:
+                            try:
+                                await self.bot._run_in_thread(clob.cancel_order, pos.sl_order_id)
+                                pos.sl_order_id = None
+                            except Exception:
+                                pass
+
+                        # P2-6: use config tp2_pct for ratcheted TP2; P2-5: gather
+                        market = self.state.get_market_data()
+                        token_id = market.token_id_up if pos.side == ReversionSide.UP else market.token_id_down
+                        new_tp2_price = round(pos.entry_price * (1 + self.config.tp2_pct) * 1.005, 4)
+                        remaining_size = round(pos.size * 0.40, 2)  # 40% hold portion
+
+                        new_tp2, new_sl = await asyncio.gather(
+                            self.bot.place_order(token_id=token_id, price=new_tp2_price, size=remaining_size, side="SELL", order_type="GTC"),
+                            self.bot.place_order(token_id=token_id, price=round(pos.entry_price, 4), size=remaining_size, side="SELL", order_type="GTC"),
+                            return_exceptions=True,
+                        )
+                        if not isinstance(new_tp2, Exception) and new_tp2.success:
+                            pos.tp2_order_id = new_tp2.order_id
+                        if not isinstance(new_sl, Exception) and new_sl.success:
+                            pos.sl_order_id = new_sl.order_id
+
+                        logger.info(f"MR: TP1 done — new TP2 @ {new_tp2_price:.3f}, SL @ break-even")
+                        return {"action": "sell", "size": filled_size, "reason": "TP1", "order_id": oid}
+
+            # Check TP2 order — let hold portion ride, SL to TP1 price
+            if pos.tp2_order_id:
+                result = await self.bot._run_in_thread(clob.get_order, pos.tp2_order_id)
+                if result.get("status") == "filled":
+                    filled_size = float(result.get("size", 0))
+                    if filled_size > 0:
+                        pos.tp2_filled = True
+                        oid = pos.tp2_order_id
+                        pos.tp2_order_id = None  # P0-4: clear immediately
+                        logger.info(f"MR: TP2 filled {filled_size} shares, letting hold ride")
+
+                        if pos.sl_order_id:
+                            try:
+                                await self.bot._run_in_thread(clob.cancel_order, pos.sl_order_id)
+                                pos.sl_order_id = None
+                            except Exception:
+                                pass
+
+                        # P2-7: SL at TP1 level for the 40% hold portion only
+                        market = self.state.get_market_data()
+                        token_id = market.token_id_up if pos.side == ReversionSide.UP else market.token_id_down
+                        tp1_price = round(pos.entry_price * (1 + self.config.tp1_pct), 4)
+                        hold_size = round(pos.size * 0.40, 2)
+
+                        new_sl = await self.bot.place_order(
+                            token_id=token_id,
+                            price=tp1_price,
+                            size=hold_size,
+                            side="SELL",
+                            order_type="GTC",
+                        )
+                        if new_sl.success:
+                            pos.sl_order_id = new_sl.order_id
+
+                        logger.info(f"MR: TP2 done — hold riding with SL @ {tp1_price:.3f}")
+                        return {"action": "sell", "size": filled_size, "reason": "TP2", "order_id": oid}
+
+            return None
+        except Exception as e:
+            logger.debug(f"MR: error checking limit orders: {e}")
+            return None
     
     async def check_exit(self) -> Optional[Dict[str, Any]]:
         """Check if position should be exited."""
@@ -533,6 +842,11 @@ class MeanReversionBot:
         if time_held < min_hold_seconds:
             logger.debug(f"MR: waiting for settlement ({time_held:.1f}s < {min_hold_seconds}s)")
             return None
+        
+        # Check if limit orders have been filled first
+        limit_result = await self._check_limit_orders(self._position)
+        if limit_result:
+            return limit_result
         
         market = self.state.get_market_data()
         
@@ -580,32 +894,30 @@ class MeanReversionBot:
         # SL = entry * (1 - sl_pct) means price dropping below entry = loss
         pos.sl_price = pos.entry_price * (1 - sl_pct)
         
-        # SL always closes 100% of position
-        if position_value >= 0.10:
-            if pos.side == ReversionSide.UP and current_price <= pos.sl_price:
-                if time.time() - pos.entry_time > self.config.time_confirm_sl:
-                    return {"action": "sell", "size": pos.size, "reason": "SL"}
-            elif pos.side == ReversionSide.DOWN and current_price <= pos.sl_price:
-                if time.time() - pos.entry_time > self.config.time_confirm_sl:
-                    return {"action": "sell", "size": pos.size, "reason": "SL"}
-        
-        # Partial TP - sell 30% at TP1
-        if not pos.tp1_filled and position_value >= 0.10:
-            if pos.side == ReversionSide.UP and current_price >= pos.entry_price * (1 + self.config.tp1_pct):
+        # --- Fallback price-level exits (only when limit orders are NOT active) ---
+        # P0-4: gate on order IDs being None to avoid double-sell races.
+
+        # SL — fallback when no active SL limit order
+        if pos.sl_order_id is None and position_value >= 0.10:
+            if current_price <= pos.sl_price:
+                return {"action": "sell", "size": pos.size, "reason": "SL"}
+
+        # Partial TP1 — fallback when no active TP1 limit order
+        if not pos.tp1_filled and pos.tp1_order_id is None and position_value >= 0.10:
+            tp1_threshold = pos.entry_price * (1 + self.config.tp1_pct + 0.01)
+            logger.debug(f"MR TP check: entry={pos.entry_price:.3f} cur={current_price:.3f} tp1_thresh={tp1_threshold:.3f}")
+            if current_price >= tp1_threshold:
+                logger.warning(f"MR TP1 TRIGGERED (fallback): entry={pos.entry_price:.3f} cur={current_price:.3f}")
                 pos.tp1_filled = True
-                return {"action": "sell", "size": pos.size * 0.3, "reason": "TP1"}
-            elif pos.side == ReversionSide.DOWN and current_price >= pos.entry_price * (1 + self.config.tp1_pct):
-                pos.tp1_filled = True
-                return {"action": "sell", "size": pos.size * 0.3, "reason": "TP1"}
-        
-        # Partial TP - sell 30% at TP2
-        if not pos.tp2_filled and position_value >= 0.10:
-            if pos.side == ReversionSide.UP and current_price >= pos.entry_price * (1 + self.config.tp2_pct):
+                return {"action": "sell", "size": pos.size * 0.30, "reason": "TP1"}
+
+        # Partial TP2 — fallback when no active TP2 limit order
+        if not pos.tp2_filled and pos.tp2_order_id is None and position_value >= 0.10:
+            tp2_threshold = pos.entry_price * (1 + self.config.tp2_pct + 0.01)
+            if current_price >= tp2_threshold:
+                logger.warning(f"MR TP2 TRIGGERED (fallback): entry={pos.entry_price:.3f} cur={current_price:.3f}")
                 pos.tp2_filled = True
-                return {"action": "sell", "size": pos.size * 0.3, "reason": "TP2"}
-            elif pos.side == ReversionSide.DOWN and current_price >= pos.entry_price * (1 + self.config.tp2_pct):
-                pos.tp2_filled = True
-                return {"action": "sell", "size": pos.size * 0.3, "reason": "TP2"}
+                return {"action": "sell", "size": pos.size * 0.30, "reason": "TP2"}
         
         # Late window: mercy stop (always closes 100%)
         # Both UP and DOWN use same formula: price below entry = loss
@@ -666,13 +978,26 @@ class MeanReversionBot:
                 price = market.down_price
         
         try:
+            # Try FOK first, then FAK if it fails
+            order_type = "FOK"
             result = await self.bot.place_order(
                 token_id=token_id,
                 price=price,
                 size=sell_size,
                 side=side,
-                order_type="FOK",
+                order_type=order_type,
             )
+            
+            # If FOK fails, try FAK for partial fill
+            if not result.success and "couldn't be fully filled" in result.message.lower():
+                order_type = "FAK"
+                result = await self.bot.place_order(
+                    token_id=token_id,
+                    price=price,
+                    size=sell_size,
+                    side=side,
+                    order_type=order_type,
+                )
             
             if result.success:
                 # PnL calculation: works same for UP and DOWN since we now
@@ -695,25 +1020,33 @@ class MeanReversionBot:
                 
                 return {"success": True, "pnl": pnl}
             else:
+                # Any close failure - increment counter
+                self._failed_close_attempts += 1
+                
                 # Check for balance/allowance error
                 if result.message and ("balance" in result.message.lower() or "allowance" in result.message.lower()):
-                    self._balance_block_until = time.time() + 3  # 3s cooldown for exits
-                    self._failed_close_attempts += 1
+                    self._balance_block_until = time.time() + 3
                     logger.warning("MR close: balance error, attempt %d", self._failed_close_attempts)
-                    
-                    # Force clear after 5 failed attempts
-                    if self._failed_close_attempts >= 5:
-                        logger.error("MR: force clearing position after 5 failed close attempts")
-                        self._position = None
-                        self._failed_close_attempts = 0
+                else:
+                    logger.warning("MR close: FOK failed (%s), attempt %d", result.message, self._failed_close_attempts)
                 
+                # Force clear after 5 failed attempts — cancel GTC orders first (P0-5)
+                if self._failed_close_attempts >= 5:
+                    logger.error("MR: force clearing position after 5 failed close attempts")
+                    if self._position:
+                        await self._cancel_all_exit_orders(self._position)
+                    self._position = None
+                    self._failed_close_attempts = 0
+
                 return {"success": False, "reason": result.message}
-                
+
         except Exception as e:
             logger.error("MeanReversion close failed: %s", e)
             self._failed_close_attempts += 1
             if self._failed_close_attempts >= 5:
                 logger.error("MR: force clearing position after 5 failed close attempts")
+                if self._position:
+                    await self._cancel_all_exit_orders(self._position)
                 self._position = None
                 self._failed_close_attempts = 0
             return {"success": False, "reason": str(e)}

@@ -190,10 +190,12 @@ class SharedState:
                 'down_price': down_price,
             })
     
-    def _calculate_depth(self, asks: list, bids: list, decay: float = 0.7) -> float:
-        """Calculate depth-weighted orderbook depth."""
+    def _calculate_depth(self, side_a: list, side_b: list, decay: float = 0.7) -> float:
+        """Calculate depth-weighted orderbook depth combining both token sides."""
         depth = 0.0
-        for i, (price, size) in enumerate(asks[:5]):
+        for i, (price, size) in enumerate(side_a[:5]):
+            depth += size * (decay ** i)
+        for i, (price, size) in enumerate(side_b[:5]):
             depth += size * (decay ** i)
         return depth
     
@@ -215,12 +217,17 @@ class SharedState:
             if oldest_price and oldest_price > 0:
                 change_2s = (price - oldest_price) / oldest_price
             
-            # Calculate 60s change
+            # Calculate 60s change — find oldest entry still within the 60s window
             change_60s = 0.0
-            if self._spot_history:
-                oldest = self._spot_history[0]
-                if now - oldest['timestamp'] <= 60 and oldest['price'] > 0:
-                    change_60s = (price - oldest['price']) / oldest['price']
+            oldest_60s_age = 0.0
+            oldest_60s_price = None
+            for entry in self._spot_history:
+                age = now - entry['timestamp']
+                if age <= 60 and age > oldest_60s_age:
+                    oldest_60s_age = age
+                    oldest_60s_price = entry['price']
+            if oldest_60s_price and oldest_60s_price > 0:
+                change_60s = (price - oldest_60s_price) / oldest_60s_price
             
             # Update EWMA for volatility
             if self._spot_ewma == 0:
@@ -244,7 +251,7 @@ class SharedState:
             self._risk.btc_spot_price = price
             self._risk.btc_spot_change_2s = change_2s
             self._risk.btc_spot_change_60s = change_60s
-            self._risk.volatility_ewma = self._risk.volatility_ewma
+            self._risk.volatility_ewma = self._spot_ewma
             self._risk.last_update = now
     
     async def record_volume(self, side: str, volume: float, timestamp: float):
@@ -301,20 +308,28 @@ class SharedState:
             )
     
     def _calculate_depth_coverage(self) -> float:
-        """Calculate what % of depth is in top 3 ticks."""
-        if not self._market.up_bids or not self._market.up_asks:
+        """Calculate what % of depth is in top 3 ticks across both UP and DOWN tokens."""
+        has_up = self._market.up_bids or self._market.up_asks
+        has_down = self._market.down_bids or self._market.down_asks
+        if not has_up and not has_down:
             return 1.0
-        
-        # Sum top 3 ticks
-        top3_bid = sum(size for _, size in list(self._market.up_bids)[:3])
-        top3_ask = sum(size for _, size in list(self._market.up_asks)[:3])
-        total_bid = sum(size for _, size in self._market.up_bids)
-        total_ask = sum(size for _, size in self._market.up_asks)
-        
-        if total_bid + total_ask == 0:
+
+        top3_up_bid = sum(size for _, size in list(self._market.up_bids)[:3])
+        top3_up_ask = sum(size for _, size in list(self._market.up_asks)[:3])
+        top3_dn_bid = sum(size for _, size in list(self._market.down_bids)[:3])
+        top3_dn_ask = sum(size for _, size in list(self._market.down_asks)[:3])
+
+        total_up_bid = sum(size for _, size in self._market.up_bids)
+        total_up_ask = sum(size for _, size in self._market.up_asks)
+        total_dn_bid = sum(size for _, size in self._market.down_bids)
+        total_dn_ask = sum(size for _, size in self._market.down_asks)
+
+        total_all = total_up_bid + total_up_ask + total_dn_bid + total_dn_ask
+        if total_all == 0:
             return 1.0
-        
-        return (top3_bid + top3_ask) / (total_bid + total_ask)
+
+        top3_all = top3_up_bid + top3_up_ask + top3_dn_bid + top3_dn_ask
+        return top3_all / total_all
     
     def get_market_data(self) -> MarketData:
         """Get current market data (thread-safe)."""

@@ -127,21 +127,26 @@ class DualBotRunner:
         momentum_config = MomentumConfig(
             bankroll=bankroll,
             max_position_pct=0.05,
-            spot_impulse_threshold=0.0001,  # 0.01% - very sensitive
+            spot_impulse_threshold=0.0020,  # P1-4: 0.20% (strategy spec)
+            high_vol_impulse=0.0018,        # 0.18% in high vol
+            low_vol_impulse=0.0025,         # 0.25% in low vol
+            cooldown_seconds=60,            # P1-9: unified 60s cooldown
+            min_signal_strength=0.4,
             tp1_pct=0.14,
             tp2_pct=0.28,
-            initial_sl_pct=0.12,
+            initial_sl_pct=0.35,
         )
         
         mr_config = MeanReversionConfig(
             bankroll=bankroll,
             max_position_pct=0.05,
-            min_drop=0.10,
-            z_threshold=1.5,
+            min_drop=0.10,           # 10% (strategy spec)
+            z_threshold=2.5,         # P1-5: strategy spec
             tp1_pct=0.22,
             tp2_pct=0.45,
-            early_sl_pct=0.18,
-            mid_sl_pct=0.15,
+            early_sl_pct=0.40,
+            mid_sl_pct=0.35,
+            cooldown_seconds=60,     # P1-9: unified 60s cooldown
         )
         
         coord_config = CoordinatorConfig(
@@ -264,6 +269,13 @@ class DualBotRunner:
                     down_asks = [(a.price, a.size) for a in down_book.asks[:10]]
                     
                     # Update shared state
+                    # P2-10: call get_countdown() once
+                    if market:
+                        mins, secs = market.get_countdown()
+                        time_to_expiry = mins * 60 + secs if mins >= 0 else 300
+                    else:
+                        time_to_expiry = 300
+
                     await self.shared_state.update_market(
                         up_price=up_book.mid_price,
                         down_price=down_book.mid_price,
@@ -274,11 +286,11 @@ class DualBotRunner:
                         token_id_up=market.up_token if market else "",
                         token_id_down=market.down_token if market else "",
                         market_slug=market.slug if market else "",
-                        time_to_expiry=market.get_countdown()[0] * 60 + market.get_countdown()[1] if market else 300,
+                        time_to_expiry=time_to_expiry,
                     )
                 
-                await asyncio.sleep(0.5)
-                
+                await asyncio.sleep(0.5)  # market update: 2 Hz
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -287,24 +299,31 @@ class DualBotRunner:
     
     async def _btc_update_loop(self):
         """Update shared state from BTC price."""
+        _stale_warned = False
         while self._running:
             try:
                 if self.btc_price:
                     price = self.btc_price.get_price()
                     if price > 0:
                         await self.shared_state.update_spot(price)
-                        
-                        # Also update mid price for divergence
+                        _stale_warned = False
                         market = self.shared_state.get_market_data()
                         self.btc_price.set_poly_mid_price(market.mid_price)
-                
-                await asyncio.sleep(0.5)
-                
+                    elif self.btc_price.is_stale(max_age=5.0) and not _stale_warned:
+                        logger.warning(
+                            "BTC price is 0 or stale — spot_change will be 0. "
+                            "Momentum bot cannot fire. Check Binance/Coinbase connectivity "
+                            "and that aiohttp is installed (pip install aiohttp)."
+                        )
+                        _stale_warned = True
+
+                await asyncio.sleep(0.3)  # P3-5: BTC price: ~3 Hz (staggered from market update)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Spot update error: %s", e)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
     
     async def _coordination_loop(self):
         """Main coordination loop."""
@@ -322,13 +341,13 @@ class DualBotRunner:
                 # Check late window
                 await self.coordinator.check_late_window()
                 
-                await asyncio.sleep(0.5)
-                
+                await asyncio.sleep(0.25)  # P3-5: coordination: 4 Hz (faster than data feeds)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Coordination error: %s", e)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.25)
     
     async def run(self):
         """Run the dual-bot system."""
