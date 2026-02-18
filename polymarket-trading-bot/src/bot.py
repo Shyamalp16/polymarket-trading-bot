@@ -393,13 +393,7 @@ class TradingBot:
             return OrderResult.from_response(response)
 
         except BalanceError as e:
-            logger.error(f"Balance/allowance error: {e}")
-            logger.error(
-                "Fix: (1) verify signature_type matches your wallet "
-                "(0=EOA, 1=Email/Magic, 2=Browser proxy) and funder/safe_address is correct, "
-                "(2) run 'python scripts/approve_tokens.py' to set on-chain allowances, "
-                "(3) check USDC balance"
-            )
+            logger.warning(f"Balance/allowance error: {e}")
             return OrderResult(
                 success=False,
                 message=str(e)
