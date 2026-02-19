@@ -148,6 +148,10 @@ class MeanReversionPosition:
     tp1_filled: bool = False
     tp2_filled: bool = False
     tp3_filled: bool = False
+    # Token ID at the time of entry.  After a market rotation the shared-state
+    # token_id changes, so close_position() MUST use this stored value — not the
+    # live market token — to avoid selling the wrong (new-market) token.
+    entry_token_id: str = ""
     # Snipe flag: if True, this position was opened by expiry_snipe and should
     # NEVER be force-closed by the mercy-SL or expiry-close logic — it holds
     # to natural on-chain resolution at $1.00.
@@ -505,9 +509,24 @@ class MeanReversionBot:
         max_retries = 3
         for attempt in range(max_retries):
             market = self.state.get_market_data()
-            exec_price = round(
-                market.up_price if signal.side == ReversionSide.UP else market.down_price, 4
-            )
+            # FOK orders must be marketable: BUY needs price >= best ask,
+            # SELL needs price <= best bid.  Using the mid price causes every
+            # FOK to be rejected with FOK_ORDER_NOT_FILLED_ERROR because the
+            # signed makerAmount never crosses the resting offer.
+            is_up = signal.side == ReversionSide.UP
+            if side == "BUY":
+                raw_price = (
+                    (market.up_asks[0][0]   if market.up_asks   else market.up_price)
+                    if is_up else
+                    (market.down_asks[0][0] if market.down_asks else market.down_price)
+                )
+            else:
+                raw_price = (
+                    (market.up_bids[0][0]   if market.up_bids   else market.up_price)
+                    if is_up else
+                    (market.down_bids[0][0] if market.down_bids else market.down_price)
+                )
+            exec_price = round(min(raw_price, 0.99), 4)
             try:
                 result = await self.bot.place_order(
                     token_id=token_id,
@@ -518,7 +537,7 @@ class MeanReversionBot:
                 )
 
                 if result.success:
-                    return self._record_fill(signal, exec_price, size, sl_pct, window_remaining)
+                    return self._record_fill(signal, exec_price, size, sl_pct, window_remaining, token_id)
 
                 is_balance_error = result.message and (
                     "balance" in result.message.lower() or "allowance" in result.message.lower()
@@ -557,6 +576,7 @@ class MeanReversionBot:
         size: float,
         sl_pct: float,
         window_remaining: int,
+        token_id: str = "",
     ) -> Dict[str, Any]:
         """Record a confirmed fill and schedule exit order placement."""
         tp1_actual = actual_entry * (1 + self.config.tp1_pct)
@@ -571,6 +591,7 @@ class MeanReversionBot:
             entry_time=time.time(),
             window_start=window_remaining,
             sl_price=sl_actual,
+            entry_token_id=token_id,
             is_snipe=is_snipe,
         )
 
@@ -671,6 +692,7 @@ class MeanReversionBot:
         return self._record_fill(
             order["signal"], order["price"], filled,
             order["sl_pct"], order["window_remaining"],
+            order["token_id"],
         )
 
     async def check_maker_escalation(self) -> Optional[Dict[str, Any]]:
@@ -706,7 +728,8 @@ class MeanReversionBot:
                 logger.info("MR: maker order filled %.2f shares @ %.4f", filled_size, order["price"])
                 return self._record_fill(
                     order["signal"], order["price"], filled_size,
-                    order["sl_pct"], order["window_remaining"]
+                    order["sl_pct"], order["window_remaining"],
+                    order["token_id"],
                 )
 
             if order_status is not None and "cancel" in order_status:
@@ -820,7 +843,8 @@ class MeanReversionBot:
             logger.info("MR: maker order (late-fill) %.2f shares @ %.4f", filled_size, order["price"])
             return self._record_fill(
                 order["signal"], order["price"], filled_size,
-                order["sl_pct"], order["window_remaining"]
+                order["sl_pct"], order["window_remaining"],
+                order["token_id"],
             )
 
         # Truly not filled — safe to cancel
@@ -847,16 +871,21 @@ class MeanReversionBot:
                     logger.debug(f"MR: could not cancel order {oid}: {e}")
 
     async def _place_exit_limit_orders(self, pos: MeanReversionPosition, exits: ReversionExit):
-        """Place GTC limit orders for SL, TP1, and TP2 immediately after entry fills.
+        """Place GTC limit orders for TP1 and TP2 immediately after entry fills.
 
-        All three are posted as resting GTC sell orders so they fill naturally
-        when price reaches each level — no FOK/FAK liquidity dependency.
+        Only TP orders are posted as resting GTC sell orders — they sit above
+        the current market and fill naturally when price rises to the target.
+
+        SL is intentionally NOT placed as a GTC order: Polymarket GTC orders
+        are marketable, so a sell limit placed below the current bid crosses
+        immediately at market price instead of resting.  The software
+        check_exit() loop monitors the SL level and fires a FAK sell when
+        current_price <= pos.sl_price.
 
         Sizes:
-          SL  → full position (exits everything on a stop)
           TP1 → 30 % of position
           TP2 → 30 % of position
-          (remaining 40 % hold is managed by ratcheted orders after TP1 fires)
+          (remaining 40 % hold is managed by ratcheted TP2 after TP1 fires)
         """
         await asyncio.sleep(3.0)  # Wait for tokens to settle after entry fill
 
@@ -872,21 +901,18 @@ class MeanReversionBot:
 
         tp1_size = round(pos.size * 0.30, 2)
         tp2_size = round(pos.size * 0.30, 2)
-        sl_size  = round(pos.size, 2)
 
         tp1_price = max(0.01, min(0.99, round(exits.tp1_price, 4)))
         tp2_price = max(0.01, min(0.99, round(exits.tp2_price, 4)))
-        sl_price  = max(0.01, min(0.99, round(exits.initial_sl, 4)))
 
         logger.info(
-            "MR: placing exit GTC orders | SL=%.4f x%.2f  TP1=%.4f x%.2f  TP2=%.4f x%.2f",
-            sl_price, sl_size, tp1_price, tp1_size, tp2_price, tp2_size,
+            "MR: placing exit GTC orders | TP1=%.4f x%.2f  TP2=%.4f x%.2f  (SL=%.4f via software)",
+            tp1_price, tp1_size, tp2_price, tp2_size, exits.initial_sl,
         )
 
-        tp1_res, tp2_res, sl_res = await asyncio.gather(
+        tp1_res, tp2_res = await asyncio.gather(
             self.bot.place_order(token_id=token_id, price=tp1_price, size=tp1_size, side="SELL", order_type="GTC"),
             self.bot.place_order(token_id=token_id, price=tp2_price, size=tp2_size, side="SELL", order_type="GTC"),
-            self.bot.place_order(token_id=token_id, price=sl_price,  size=sl_size,  side="SELL", order_type="GTC"),
             return_exceptions=True,
         )
 
@@ -901,29 +927,24 @@ class MeanReversionBot:
             logger.info("MR: TP2 GTC resting @ %.4f x%.2f [%s]", tp2_price, tp2_size, tp2_res.order_id[:8])
         else:
             logger.warning("MR: TP2 GTC failed: %s", tp2_res)
-
-        if not isinstance(sl_res, Exception) and sl_res.success:
-            pos.sl_order_id = sl_res.order_id
-            logger.info("MR: SL  GTC resting @ %.4f x%.2f [%s]", sl_price, sl_size, sl_res.order_id[:8])
-        else:
-            logger.warning("MR: SL GTC failed: %s", sl_res)
     
     async def _cancel_remaining_orders(self, pos: MeanReversionPosition, reason: str):
-        """Cancel remaining limit orders after one fills."""
+        """Cancel remaining GTC TP orders after an exit fires.
+
+        SL is software-monitored (no GTC order), so there is never a GTC SL
+        order to cancel here.  close_position() independently cancels all
+        outstanding GTC orders before submitting the FAK sell.
+        """
         clob = self.bot.clob_client
-        orders_to_cancel = []
-        
+        orders_to_cancel: list[Optional[str]] = []
+
         if reason == "SL":
-            # Cancel TPs if SL hit
             orders_to_cancel = [pos.tp1_order_id, pos.tp2_order_id]
-        elif reason in ["TP1", "TP2"]:
-            # Cancel SL and other TP if one TP hit
-            orders_to_cancel = [pos.sl_order_id]
-            if reason == "TP1":
-                orders_to_cancel.append(pos.tp2_order_id)
-            elif reason == "TP2":
-                orders_to_cancel.append(pos.tp1_order_id)
-        
+        elif reason == "TP1":
+            orders_to_cancel = [pos.tp2_order_id]
+        elif reason == "TP2":
+            orders_to_cancel = [pos.tp1_order_id]
+
         for order_id in orders_to_cancel:
             if order_id:
                 try:
@@ -963,11 +984,14 @@ class MeanReversionBot:
         return {"success": True, "pnl": pnl}
 
     async def _check_limit_orders(self, pos: MeanReversionPosition) -> Optional[Dict[str, Any]]:
-        """Check if any limit orders have been filled.
+        """Check if any TP limit orders have been filled.
 
         Throttled to every 5 seconds (P2-1) to avoid flooding the REST API.
+
+        SL is handled entirely by the software check_exit() loop — no GTC SL
+        order is placed, so there is nothing to poll here for the stop.
         """
-        if not pos.sl_order_id and not pos.tp1_order_id and not pos.tp2_order_id:
+        if not pos.tp1_order_id and not pos.tp2_order_id:
             return None
 
         # P2-1: throttle HTTP polling to every 5 seconds
@@ -979,22 +1003,7 @@ class MeanReversionBot:
         try:
             clob = self.bot.clob_client
 
-            # Check SL order
-            if pos.sl_order_id:
-                result = await self.bot.get_order(pos.sl_order_id) or {}
-                if result.get("status") in ("matched", "MATCHED"):
-                    filled_size = float(result.get("size_matched") or result.get("size", 0))
-                    if filled_size > 0:
-                        logger.info(f"MR: SL filled {filled_size} shares")
-                        oid = pos.sl_order_id
-                        pos.sl_order_id = None  # P0-4: clear immediately
-                        await self._cancel_remaining_orders(pos, "SL")
-                        return {
-                            "action": "sell", "size": filled_size, "reason": "SL", "order_id": oid,
-                            "already_filled": True, "fill_price": pos.sl_price,
-                        }
-
-            # Check TP1 order — ratchet: sell 30%, new TP2 at config level, SL at break-even
+            # Check TP1 order — ratchet: sell 30%, new TP2 at config level
             if pos.tp1_order_id:
                 result = await self.bot.get_order(pos.tp1_order_id) or {}
                 if result.get("status") in ("matched", "MATCHED"):
@@ -1005,37 +1014,31 @@ class MeanReversionBot:
                         pos.tp1_order_id = None  # P0-4: clear immediately
                         logger.info(f"MR: TP1 filled {filled_size} shares")
 
-                        # Cancel old TP2 and SL before placing new ones
+                        # Cancel old resting TP2 before placing a tighter ratcheted one
                         if pos.tp2_order_id:
                             try:
                                 await self.bot._run_in_thread(clob.cancel_order, pos.tp2_order_id)
                                 pos.tp2_order_id = None
                             except Exception:
                                 pass
-                        if pos.sl_order_id:
-                            try:
-                                await self.bot._run_in_thread(clob.cancel_order, pos.sl_order_id)
-                                pos.sl_order_id = None
-                            except Exception:
-                                pass
 
-                        # P2-6: use config tp2_pct for ratcheted TP2; P2-5: gather
+                        # P2-6: ratcheted TP2 for the 40% hold portion
                         market = self.state.get_market_data()
                         token_id = market.token_id_up if pos.side == ReversionSide.UP else market.token_id_down
                         new_tp2_price = round(pos.entry_price * (1 + self.config.tp2_pct) * 1.005, 4)
                         remaining_size = round(pos.size * 0.40, 2)  # 40% hold portion
 
-                        new_tp2, new_sl = await asyncio.gather(
-                            self.bot.place_order(token_id=token_id, price=new_tp2_price, size=remaining_size, side="SELL", order_type="GTC"),
-                            self.bot.place_order(token_id=token_id, price=round(pos.entry_price, 4), size=remaining_size, side="SELL", order_type="GTC"),
-                            return_exceptions=True,
+                        new_tp2 = await self.bot.place_order(
+                            token_id=token_id, price=new_tp2_price,
+                            size=remaining_size, side="SELL", order_type="GTC",
                         )
                         if not isinstance(new_tp2, Exception) and new_tp2.success:
                             pos.tp2_order_id = new_tp2.order_id
-                        if not isinstance(new_sl, Exception) and new_sl.success:
-                            pos.sl_order_id = new_sl.order_id
 
-                        logger.info(f"MR: TP1 done — new TP2 @ {new_tp2_price:.3f}, SL @ break-even")
+                        logger.info(
+                            "MR: TP1 done — new TP2 @ %.3f  (SL trailing via software)",
+                            new_tp2_price,
+                        )
                         tp1_fill_price = round(pos.entry_price * (1 + self.config.tp1_pct), 4)
                         return {
                             "action": "sell", "size": filled_size, "reason": "TP1", "order_id": oid,
@@ -1051,32 +1054,10 @@ class MeanReversionBot:
                         pos.tp2_filled = True
                         oid = pos.tp2_order_id
                         pos.tp2_order_id = None  # P0-4: clear immediately
-                        logger.info(f"MR: TP2 filled {filled_size} shares, letting hold ride")
-
-                        if pos.sl_order_id:
-                            try:
-                                await self.bot._run_in_thread(clob.cancel_order, pos.sl_order_id)
-                                pos.sl_order_id = None
-                            except Exception:
-                                pass
-
-                        # P2-7: SL at TP1 level for the 40% hold portion only
-                        market = self.state.get_market_data()
-                        token_id = market.token_id_up if pos.side == ReversionSide.UP else market.token_id_down
-                        tp1_price = round(pos.entry_price * (1 + self.config.tp1_pct), 4)
-                        hold_size = round(pos.size * 0.40, 2)
-
-                        new_sl = await self.bot.place_order(
-                            token_id=token_id,
-                            price=tp1_price,
-                            size=hold_size,
-                            side="SELL",
-                            order_type="GTC",
+                        logger.info(
+                            "MR: TP2 filled %.2f shares — hold portion riding, SL trailing via software",
+                            filled_size,
                         )
-                        if new_sl.success:
-                            pos.sl_order_id = new_sl.order_id
-
-                        logger.info(f"MR: TP2 done — hold riding with SL @ {tp1_price:.3f}")
                         tp2_fill_price = round(pos.entry_price * (1 + self.config.tp2_pct), 4)
                         return {
                             "action": "sell", "size": filled_size, "reason": "TP2", "order_id": oid,
@@ -1196,7 +1177,10 @@ class MeanReversionBot:
                 return {"action": "sell", "size": pos.size * 0.30, "reason": "TP2"}
 
         # TP3 — absolute price level ≥ 0.90 — sell 100% immediately, no prerequisite
-        if not pos.tp3_filled and position_value >= 0.10:
+        # Skip for snipe positions: the whole point is to hold to $1.00 on-chain
+        # resolution, and snipe entries are already above 0.90, so TP3 would fire
+        # immediately and cause a rapid buy/sell loop.
+        if not pos.is_snipe and not pos.tp3_filled and position_value >= 0.10:
             if current_price >= self.config.tp3_price:
                 logger.info(
                     "MR TP3 TRIGGERED (≥%.2f): cur=%.4f — selling 100%%",
@@ -1295,20 +1279,25 @@ class MeanReversionBot:
         if sell_size < 0.01:
             return {"success": False, "reason": "size too small"}
 
+        # Use the token_id captured at entry — after a market rotation the live
+        # market token changes to the new window, which we don't own.
+        token_id = self._position.entry_token_id
+        if not token_id:
+            # Fallback for positions recorded before this field was added
+            token_id = market.token_id_up if self._position.side == ReversionSide.UP else market.token_id_down
+
         if self._position.side == ReversionSide.UP:
-            token_id = market.token_id_up
             if market.up_bids:
                 initial_price = market.up_bids[0][0]
             else:
                 initial_price = market.up_price
         else:
-            token_id = market.token_id_down
             if market.down_bids:
                 initial_price = market.down_bids[0][0]
             else:
                 initial_price = market.down_price
 
-        # Pre-flight: empty token_id means market rotated; bail immediately
+        # Pre-flight: empty token_id means we have no idea what to sell
         if not token_id:
             msg = f"no token_id for {self._position.side.value} (market rotated?)"
             logger.error("==> MR CLOSE FAILED: %s | attempt %d | reason: %s",

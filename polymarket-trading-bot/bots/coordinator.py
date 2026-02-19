@@ -355,6 +355,12 @@ class Coordinator:
         if not (5 <= tte <= 30):
             return None
 
+        # One snipe per window — if MR already had a position this window (including
+        # a prior snipe that exited), don't fire again.  Without this guard a rapid
+        # TP3/SL exit would free the MR bot and immediately trigger another snipe.
+        if self._window and self._window.mr_had_position:
+            return None
+
         # Block only if MR bot itself is currently holding a position or mid-entry
         if self.mean_reversion.has_position:
             return None
@@ -382,7 +388,7 @@ class Coordinator:
 
         # Snipe size: 7 shares — slightly larger than normal entries to make the
         # near-certain resolution payout worth the FOK spread cost.
-        size = 7.0
+        size = 10.5
 
         logger.info(
             "==> EXPIRY SNIPE: %s @ %.3f | %ds remaining | expect $1.00 resolution",
@@ -468,6 +474,12 @@ class Coordinator:
     async def _approve_momentum(self, signal, risk) -> Optional[Dict[str, Any]]:
         """Approve momentum entry with checks."""
 
+        # Block regular entries while spread bot has active legs or a filled position.
+        # Snipes bypass this method entirely so they are unaffected.
+        if self.spread and self.spread.has_position:
+            logger.debug("Momentum: blocked — SPR trade active")
+            return None
+
         # Already in a position
         if self.momentum.has_position:
             logger.debug("Momentum: already has position")
@@ -543,6 +555,12 @@ class Coordinator:
     
     async def _approve_mean_reversion(self, signal, risk, in_impulse_window: bool) -> Optional[Dict[str, Any]]:
         """Approve mean reversion entry with checks."""
+
+        # Block regular entries while spread bot has active legs or a filled position.
+        # Snipes bypass this method entirely so they are unaffected.
+        if self.spread and self.spread.has_position:
+            logger.debug("MR: blocked — SPR trade active")
+            return None
 
         # Already in a position OR a maker order is resting (pending fill).
         # Without the second check the coordinator would approve new entries every

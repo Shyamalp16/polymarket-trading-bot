@@ -597,11 +597,24 @@ class SpreadBot:
     async def on_window_reset(self) -> None:
         """
         Called by the coordinator when a new market window is detected.
-        Cancels any unfilled GTX orders from the previous window.
+        Cancels any unfilled GTX orders from the previous window and releases
+        any fully-locked spread position (both legs filled) so the bot can
+        enter a new spread in the next window.  Locked tokens resolve on-chain
+        automatically — no close action is needed.
         """
         if self._legs:
             logger.info("Spread: new market — cancelling stale GTX orders")
             await self._cancel_legs()
+
+        if self._position and self._position.status == "spread":
+            logger.info(
+                "Spread: new market — releasing locked spread "
+                "(UP %.3f + DOWN %.3f, expect +$%.2f on-chain resolution)",
+                self._position.up_entry,
+                self._position.down_entry,
+                self._position.guaranteed_profit,
+            )
+            self._position = None
 
         self._spread_attempted_this_window = False
 

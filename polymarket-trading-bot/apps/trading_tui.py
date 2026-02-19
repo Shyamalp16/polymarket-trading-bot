@@ -243,7 +243,10 @@ class TradingEventCapture(logging.Handler):
     # ── logging.Handler interface ─────────────────────────────────────────────
 
     def emit(self, record: logging.LogRecord) -> None:
-        ev = self._parse(record.getMessage())
+        try:
+            ev = self._parse(record.getMessage())
+        except Exception:
+            return  # never let a parse error crash the caller's thread
         if ev:
             if ev.etype == "MARKET":
                 # New window → clear the per-window log and reset window PnL
@@ -270,12 +273,33 @@ class TradingEventCapture(logging.Handler):
             g = m.groups()
 
             if etype == "ENTRY":
-                side, cost, entry, tp1, tp2, sl = g
-                detail = f"{side:<4} {cost}sh @ {entry}  SL={sl}  TP1={tp1}  TP2={tp2}"
-                return TEvent(etype="ENTRY", bot=bot, side=side, detail=detail)
+                if len(g) == 6:
+                    # Standard bot entry: (side, cost, entry, tp1, tp2, sl)
+                    side, cost, entry, tp1, tp2, sl = g
+                    detail = f"{side:<4} {cost}sh @ {entry}  SL={sl}  TP1={tp1}  TP2={tp2}"
+                    return TEvent(etype="ENTRY", bot=bot, side=side, detail=detail)
+                elif len(g) == 3 and "EXPIRY SNIPE" in msg:
+                    # Expiry snipe: (side, price, tte_secs)
+                    snap_side, snap_price, snap_tte = g
+                    detail = f"{snap_side:<4} snipe @ {snap_price}  {snap_tte}s left"
+                    return TEvent(etype="ENTRY", bot="MR", side=snap_side, detail=detail)
+                elif len(g) == 3:
+                    # Spread posted: (up_bid, down_bid, size_per_leg)
+                    up_bid, dn_bid, size = g
+                    detail = f"UP @ {up_bid}  DN @ {dn_bid}  {size}sh/leg"
+                    return TEvent(etype="ENTRY", bot=bot, side="--", detail=detail)
 
             if etype == "EXIT":
-                reason, shares, price, pnl_raw = g
+                if len(g) == 4:
+                    # Bot exit: (reason, shares, price, pnl_raw)
+                    reason, shares, price, pnl_raw = g
+                elif len(g) == 3:
+                    # Spread closed: (reason, shares, pnl_raw) — no fill price
+                    reason, shares, pnl_raw = g
+                    price = "—"
+                else:
+                    reason, pnl_raw = str(g[0]), str(g[-1])
+                    shares, price = "?", "?"
                 try:
                     pnl = float(pnl_raw.replace("$", "").replace("+", ""))
                 except ValueError:
@@ -284,9 +308,18 @@ class TradingEventCapture(logging.Handler):
                 return TEvent(etype="EXIT", bot=bot, side="--", detail=detail, pnl=pnl)
 
             if etype == "SIGNAL":
-                side, conf, info = g
-                detail = f"{side:<4} conf={conf}  {info.strip()}"
-                return TEvent(etype="SIGNAL", bot=bot, side=side, detail=detail)
+                if len(g) == 3:
+                    side, conf, info = g
+                    detail = f"{side:<4} conf={conf}  {info.strip()}"
+                    return TEvent(etype="SIGNAL", bot=bot, side=side, detail=detail)
+                elif len(g) == 4:
+                    # SPR single leg: (side, price, shares, sl)
+                    s_side, s_price, s_shares, s_sl = g
+                    detail = f"{s_side:<4} single @ {s_price}  {s_shares}sh  SL={s_sl}"
+                    return TEvent(etype="SIGNAL", bot=bot, side=s_side, detail=detail)
+                else:
+                    detail = "  ".join(str(x) for x in g)
+                    return TEvent(etype="SIGNAL", bot=bot, side="--", detail=detail)
 
             if etype == "MARKET":
                 return TEvent(etype="MARKET", bot="SYS", side="--", detail=f"NEW MARKET  {g[0]}")
@@ -685,9 +718,9 @@ class TradingTUI:
             + _c(C.B + C.YLW, "[2]") + _c(C.DIM, " BotB  ")
             + _c(C.B + C.YLW, "[3]") + _c(C.DIM, " BotC  ")
             + _c(C.B + C.YLW, "[0]") + _c(C.DIM, " all  ")
+            + _c(C.DIM, "← clear display only, no cancel/sell sent  ")
             + _c(C.B + C.CYN, "[c]") + _c(C.DIM, " screen  ")
             + _c(C.B + C.CYN, "[e]") + _c(C.DIM, " errors")
-            + _c(C.DIM, "  (local only — no trades sent)")
         )
 
         sys.stdout.write("\033[H\033[J" + "\n".join(lines) + "\n")
