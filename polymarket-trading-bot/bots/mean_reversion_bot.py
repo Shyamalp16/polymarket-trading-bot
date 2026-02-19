@@ -73,9 +73,9 @@ class ReversionExit:
     tp1_size_pct: float = 0.30
     tp2_size_pct: float = 0.30
     hold_pct: float = 0.40
-    early_sl_pct: float = 0.40
-    mid_sl_pct: float = 0.35
-    mercy_sl_pct: float = 0.30
+    early_sl_pct: float = 0.20
+    mid_sl_pct: float = 0.15
+    mercy_sl_pct: float = 0.10
 
 
 @dataclass
@@ -118,10 +118,11 @@ class MeanReversionConfig:
     # Exits
     tp1_pct: float = 0.22            # +22%
     tp2_pct: float = 0.45            # +45%
+    tp3_price: float = 0.90          # absolute price level — sell 100% at ≥90¢
     trailing_sl_pct: float = 0.15    # trail 15% below peak — activates after TP1
-    early_sl_pct: float = 0.40       # -40% early window
-    mid_sl_pct: float = 0.35         # -35% mid window
-    mercy_sl_pct: float = 0.30       # -30% mercy
+    early_sl_pct: float = 0.20       # -20% early window  (was 40% — never fired)
+    mid_sl_pct: float = 0.15         # -15% mid window    (was 35% — never fired)
+    mercy_sl_pct: float = 0.10       # -10% last 45 s     (was 30% — never fired)
     time_confirm_sl: float = 10.0       # seconds - no SL in first 10s
     
     # Depth cap
@@ -132,7 +133,7 @@ class MeanReversionConfig:
 
     # Cooldown
     cooldown_seconds: int = 60
-    min_signal_strength: float = 0.25
+    min_signal_strength: float = 0.45
 
 
 @dataclass
@@ -146,6 +147,7 @@ class MeanReversionPosition:
     sl_price: float = 0.0
     tp1_filled: bool = False
     tp2_filled: bool = False
+    tp3_filled: bool = False
     # Limit orders for automated exits
     sl_order_id: Optional[str] = None
     tp1_order_id: Optional[str] = None
@@ -282,7 +284,10 @@ class MeanReversionBot:
         if len(history) < 5:
             return None
 
-        # Calculate peak-to-trough drop within the detection window
+        # Measure peak-to-CURRENT drop within the detection window.
+        # Using current_price instead of trough ensures we only enter while
+        # the price is STILL at the dislocation level, not after it has already
+        # bounced — trough-based measurement would fire stale signals.
         now = time.time()
         window_prices = [
             h['price'] for h in history
@@ -293,11 +298,17 @@ class MeanReversionBot:
             return None
 
         peak = max(window_prices)
-        trough = min(window_prices)
-        drop = (peak - trough) / peak if peak > 0 else 0
+        drop = (peak - current_price) / peak if peak > 0 else 0
 
         if drop < min_drop:
             logger.debug(f"MR {side.value}: drop {drop*100:.1f}% < threshold {min_drop*100:.1f}%")
+            return None
+
+        # Price zone filter — only trade mid-range tokens.
+        # Tokens near 0 or 1 are resolving correctly (not dislocated); MR there is
+        # fighting the market's actual assessment, not a flash crash.
+        if current_price < 0.18 or current_price > 0.82:
+            logger.debug(f"MR {side.value}: price {current_price:.3f} outside tradeable zone [0.18, 0.82]")
             return None
 
         # P3-3: directional cause filter — only suppress when spot moved in the SAME
@@ -325,13 +336,14 @@ class MeanReversionBot:
             logger.debug(f"MR {side.value}: z={z_score:.1f} < {self.config.z_threshold}")
             return None
 
-        # P1-6: OB confirmation — both sides use (1 - imbalance).
-        # imbalance = ask_depth / total_depth on the UP token.
-        # Lower imbalance = more bids = buyers present = price support.
-        # This is valid for BOTH UP (buy the dip) and DOWN reversion (UP spike
-        # exhausting = sellers overwhelming bids on UP token = DOWN token recovering).
+        # OB confirmation — uses UP-token imbalance = ask_depth / total_depth.
+        # UP reversion:   ob_support = 1 - imbalance = UP bid fraction.
+        #                 High value → lots of UP buyers → UP price will bounce.
+        # DOWN reversion: ob_support = imbalance = UP ask fraction.
+        #                 High value → lots of UP sellers (= DOWN buyers) → DOWN price will bounce.
+        # The two cases are OPPOSITE because in binary markets selling YES = buying NO.
         imbalance = self.state.get_imbalance()
-        ob_support = 1 - imbalance
+        ob_support = (1 - imbalance) if side == ReversionSide.UP else imbalance
 
         if ob_support < self.config.ob_imbalance_threshold:
             logger.debug(f"MR {side.value}: ob={ob_support:.2f} < {self.config.ob_imbalance_threshold}")
@@ -406,11 +418,14 @@ class MeanReversionBot:
         if signal.side == ReversionSide.UP:
             token_id = market.token_id_up
             side = "BUY"
-            maker_price = max(0.01, min(0.99, market.mid_price - self.config.maker_spread_offset))
+            # Bid just below UP token's current price to post as maker
+            maker_price = max(0.01, min(0.99, market.up_price - self.config.maker_spread_offset))
         else:
             token_id = market.token_id_down
             side = "BUY"
-            maker_price = max(0.01, min(0.99, market.mid_price + self.config.maker_spread_offset))
+            # Bid just below DOWN token's current price to post as maker
+            # (was market.mid_price + offset which used the UP price — always GTX-rejected)
+            maker_price = max(0.01, min(0.99, market.down_price - self.config.maker_spread_offset))
 
         window_remaining = market.time_to_expiry
         sl_pct = self.config.early_sl_pct if window_remaining > 180 else self.config.mid_sl_pct
@@ -950,14 +965,12 @@ class MeanReversionBot:
         # Recalculate position_value for exit checks
         position_value = current_price * pos.size
         
-        # Determine SL based on window
+        # Determine SL pct based on *current* time remaining — tightens as expiry nears
         window_remaining = market.time_to_expiry
-        if pos.window_start > 180:
-            # Early window
-            sl_pct = self.config.early_sl_pct
+        if window_remaining > 180:
+            sl_pct = self.config.early_sl_pct   # -20%: early, more room to breathe
         else:
-            # Mid window
-            sl_pct = self.config.mid_sl_pct
+            sl_pct = self.config.mid_sl_pct     # -15%: mid/late, tighter
         
         # ── Trailing SL ──────────────────────────────────────────────────────────
         # Track peak price since entry
@@ -1010,6 +1023,16 @@ class MeanReversionBot:
                 pos.tp2_filled = True
                 return {"action": "sell", "size": pos.size * 0.30, "reason": "TP2"}
 
+        # TP3 — absolute price level ≥ 0.90 — sell 100% immediately, no prerequisite
+        if not pos.tp3_filled and position_value >= 0.10:
+            if current_price >= self.config.tp3_price:
+                logger.info(
+                    "MR TP3 TRIGGERED (≥%.2f): cur=%.4f — selling 100%%",
+                    self.config.tp3_price, current_price,
+                )
+                pos.tp3_filled = True
+                return {"action": "sell", "size": pos.size, "reason": "TP3"}
+
         logger.debug("MR TP check: entry=%.3f cur=%.3f tp1=%.3f tp2=%.3f", pos.entry_price, current_price, tp1_threshold, tp2_threshold)
         
         # Late window: mercy stop (always closes 100%)
@@ -1026,125 +1049,189 @@ class MeanReversionBot:
         
         return None
     
+    def _force_clear_position(self, cause: str) -> None:
+        """
+        Wipe the local position after repeated close failures.
+        Records estimated PnL at the current market mid so session/window
+        totals reflect the real loss — no trades are sent to Polymarket.
+        """
+        if not self._position:
+            return
+        pos = self._position
+        try:
+            market = self.state.get_market_data()
+            est_price = (
+                market.up_price if pos.side == ReversionSide.UP else market.down_price
+            )
+            est_pnl = (est_price - pos.entry_price) * pos.size
+            self._realized_pnl += est_pnl
+            self._window_pnl   += est_pnl
+            pnl_str = f"+${est_pnl:.2f}" if est_pnl >= 0 else f"-${abs(est_pnl):.2f}"
+            logger.error(
+                "MR: force-clear (%s) — est exit @ %.4f  est PnL %s",
+                cause, est_price, pnl_str,
+            )
+        except Exception:
+            logger.error("MR: force-clear (%s) — could not estimate PnL", cause)
+        self._position = None
+        self._failed_close_attempts = 0
+
     async def close_position(self, reason: str = "manual", sell_size: Optional[float] = None) -> Dict[str, Any]:
-        """Close current position (full or partial)."""
+        """
+        Close current position (full or partial).
+
+        Retry strategy (mirrors strategies/base.py execute_sell):
+          1. Poll CLOB balance up to 3× before the first order attempt to
+             confirm tokens have settled from the entry FOK fill.
+          2. Retry the FOK up to MAX_CLOSE_ATTEMPTS times, dropping the
+             sell price by PRICE_STEP each attempt to chase liquidity.
+          3. On "balance not settled" errors: refresh balance and wait
+             progressively longer before the next attempt.
+          4. Hard abort (force-clear) after FORCE_CLEAR_CALLS consecutive
+             fully-exhausted call sequences.
+        """
+        MAX_CLOSE_ATTEMPTS = 5   # retries per close_position() call
+        PRICE_STEP = 0.02        # drop sell price 2 ticks each retry
+        BALANCE_POLLS = 3        # CLOB balance polls before first order
+        FORCE_CLEAR_CALLS = 3    # fully-failed calls before force-clear
+
         if not self._position:
             return {"success": False, "reason": "no position"}
-        
-        # Check balance block cooldown
-        if time.time() < self._balance_block_until:
-            return {"success": False, "reason": "balance cooldown"}
-        
+
         # Wait for token settlement after recent entry (FOK fills need time)
         time_since_entry = time.time() - self._position.entry_time
         if time_since_entry < 3.0:
             wait_time = 3.0 - time_since_entry
-            logger.debug(f"MR: waiting {wait_time:.1f}s for token settlement")
+            logger.debug("MR: waiting %.1fs for token settlement", wait_time)
             await asyncio.sleep(wait_time)
-        
+
         market = self.state.get_market_data()
-        
+
         # Determine size to sell (default to full position)
         if sell_size is None:
             sell_size = self._position.size
-        
+
         # Round to 2 decimals (FOK requirement)
         sell_size = int(sell_size * 100) / 100.0
         if sell_size < 0.01:
             return {"success": False, "reason": "size too small"}
-        
+
         if self._position.side == ReversionSide.UP:
             token_id = market.token_id_up
-            side = "SELL"
-            # Use best bid for better FOK fill, fallback to mid
             if market.up_bids:
-                price = market.up_bids[0][0]  # Best bid
+                initial_price = market.up_bids[0][0]
             else:
-                price = market.up_price
+                initial_price = market.up_price
         else:
             token_id = market.token_id_down
-            side = "SELL"  # Must SELL to close a DOWN position
-            # Use best bid for better FOK fill, fallback to mid
             if market.down_bids:
-                price = market.down_bids[0][0]  # Best bid
+                initial_price = market.down_bids[0][0]
             else:
-                price = market.down_price
-        
-        try:
-            # Try FOK first, then FAK if it fails
-            order_type = "FOK"
-            result = await self.bot.place_order(
-                token_id=token_id,
-                price=price,
-                size=sell_size,
-                side=side,
-                order_type=order_type,
-            )
-            
-            # If FOK fails, try FAK for partial fill
-            if not result.success and "couldn't be fully filled" in result.message.lower():
-                order_type = "FAK"
+                initial_price = market.down_price
+
+        # Pre-flight: empty token_id means market rotated; bail immediately
+        if not token_id:
+            msg = f"no token_id for {self._position.side.value} (market rotated?)"
+            logger.error("==> MR CLOSE FAILED: %s | attempt %d | reason: %s",
+                         reason.upper(), self._failed_close_attempts + 1, msg)
+            self._failed_close_attempts += 1
+            if self._failed_close_attempts >= FORCE_CLEAR_CALLS:
+                self._force_clear_position(msg)
+            return {"success": False, "reason": msg}
+
+        if initial_price <= 0:
+            msg = f"price={initial_price:.4f} (no bids + stale mid)"
+            logger.error("==> MR CLOSE FAILED: %s | attempt %d | reason: %s",
+                         reason.upper(), self._failed_close_attempts + 1, msg)
+            self._failed_close_attempts += 1
+            if self._failed_close_attempts >= FORCE_CLEAR_CALLS:
+                self._force_clear_position(msg)
+            return {"success": False, "reason": msg}
+
+        # ── Phase 1: poll CLOB balance until tokens are visible ──────────────
+        # Tokens from the entry FOK take a few seconds to appear in the CLOB
+        # cache.  Sending a sell before they settle causes "not enough balance".
+        for poll in range(BALANCE_POLLS):
+            try:
+                await self.bot.update_balance_allowance("CONDITIONAL", token_id)
+                bal = await self.bot.get_balance_allowance("CONDITIONAL", token_id)
+                if bal and float(bal.get("balance", 0)) > 0:
+                    break
+            except Exception:
+                pass
+            if poll < BALANCE_POLLS - 1:
+                logger.debug("MR close: CLOB balance empty, waiting 3s (poll %d/%d)",
+                             poll + 1, BALANCE_POLLS)
+                await asyncio.sleep(3.0)
+
+        # ── Phase 2: retry loop with price widening ───────────────────────────
+        for attempt in range(MAX_CLOSE_ATTEMPTS):
+            # Drop sell price each retry to chase liquidity lower in the book
+            sell_price = max(0.01, initial_price - attempt * PRICE_STEP)
+
+            try:
                 result = await self.bot.place_order(
                     token_id=token_id,
-                    price=price,
+                    price=sell_price,
                     size=sell_size,
-                    side=side,
-                    order_type=order_type,
+                    side="SELL",
+                    order_type="FOK",
                 )
-            
+            except Exception as e:
+                logger.error("==> MR CLOSE FAILED: %s | attempt %d | reason: exception — %s",
+                             reason.upper(), attempt + 1, e)
+                await asyncio.sleep(1.0)
+                continue
+
             if result.success:
-                # PnL calculation: works same for UP and DOWN since we now
-                # BUY to open and SELL to close both positions
-                pnl = (price - self._position.entry_price) * sell_size
-                
+                pnl = (sell_price - self._position.entry_price) * sell_size
                 if pnl > 0:
                     self._wins_today += 1
                 self._realized_pnl += pnl
                 self._window_pnl   += pnl
-                
-                # Update position size (for partial sells)
                 self._position.size -= sell_size
-                self._failed_close_attempts = 0  # Reset on success
-                
-                # Clear position if fully sold
+                self._failed_close_attempts = 0
                 if self._position.size < 0.01:
                     self._position = None
-                
-                pnl_str = f"+${pnl:.2f}" if pnl > 0 else f"-${abs(pnl):.2f}"
-                logger.info(f"==> MR CLOSED: {reason.upper()} | {sell_size:.2f}sh @ {price:.4f} | PnL: {pnl_str}")
-                
+                pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+                if attempt > 0:
+                    logger.info("MR close: filled on attempt %d @ %.4f (slippage %.4f)",
+                                attempt + 1, sell_price, initial_price - sell_price)
+                logger.info("==> MR CLOSED: %s | %.2fsh @ %.4f | PnL: %s",
+                            reason.upper(), sell_size, sell_price, pnl_str)
                 return {"success": True, "pnl": pnl}
-            else:
-                # Any close failure - increment counter
-                self._failed_close_attempts += 1
-                
-                # Check for balance/allowance error
-                if result.message and ("balance" in result.message.lower() or "allowance" in result.message.lower()):
-                    self._balance_block_until = time.time() + 3
-                    logger.warning("MR close: balance error, attempt %d", self._failed_close_attempts)
-                else:
-                    logger.warning("MR close: FOK failed (%s), attempt %d", result.message, self._failed_close_attempts)
-                
-                # Force clear after 5 failed attempts — cancel GTC orders first (P0-5)
-                if self._failed_close_attempts >= 5:
-                    logger.error("MR: force clearing position after 5 failed close attempts")
-                    if self._position:
-                        await self._cancel_all_exit_orders(self._position)
-                    self._position = None
-                    self._failed_close_attempts = 0
 
-                return {"success": False, "reason": result.message}
+            err_msg = result.message or "unknown"
 
-        except Exception as e:
-            logger.error("MeanReversion close failed: %s", e)
-            self._failed_close_attempts += 1
-            if self._failed_close_attempts >= 5:
-                logger.error("MR: force clearing position after 5 failed close attempts")
-                if self._position:
-                    await self._cancel_all_exit_orders(self._position)
-                self._position = None
-                self._failed_close_attempts = 0
-            return {"success": False, "reason": str(e)}
+            if "balance" in err_msg.lower() or "allowance" in err_msg.lower():
+                # Tokens still settling — refresh and wait progressively longer
+                wait = 5.0 + attempt * 5.0
+                logger.warning("MR close: balance not settled (attempt %d), refreshing + %.0fs wait",
+                                attempt + 1, wait)
+                try:
+                    await self.bot.update_balance_allowance("CONDITIONAL", token_id)
+                except Exception:
+                    pass
+                await asyncio.sleep(wait)
+                continue
+
+            if "fill" in err_msg.lower() or "fok" in err_msg.lower():
+                # FOK not filled — lower price on next attempt, no extra wait
+                logger.debug("MR close: FOK not filled @ %.4f (attempt %d), retrying lower",
+                             sell_price, attempt + 1)
+                continue
+
+            # Unknown error — short pause then retry at lower price
+            logger.warning("MR close: unknown error (attempt %d): %s", attempt + 1, err_msg)
+            await asyncio.sleep(0.5)
+
+        # ── All attempts exhausted for this call ──────────────────────────────
+        self._failed_close_attempts += 1
+        logger.error("==> MR CLOSE FAILED: %s | attempt %d | reason: all %d retries exhausted",
+                     reason.upper(), self._failed_close_attempts, MAX_CLOSE_ATTEMPTS)
+        if self._failed_close_attempts >= FORCE_CLEAR_CALLS:
+            self._force_clear_position(f"{FORCE_CLEAR_CALLS} fully-exhausted close calls")
+        return {"success": False, "reason": f"all {MAX_CLOSE_ATTEMPTS} retries exhausted"}
     
     def get_stats(self) -> Dict[str, Any]:
         """Get bot statistics."""

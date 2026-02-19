@@ -100,7 +100,8 @@ class MomentumConfig:
     # Exits
     tp1_pct: float = 0.14              # +14%
     tp2_pct: float = 0.28              # +28%
-    initial_sl_pct: float = 0.35       # -35%
+    tp3_price: float = 0.90            # absolute price level — sell 100% at ≥90¢
+    initial_sl_pct: float = 0.20       # -20%  (was 35% — never fired)
     trailing_sl_pct: float = 0.15      # trail 15% below peak — activates after TP1
     time_confirm_sl: float = 10.0       # seconds - no SL in first 10s
     early_exit_vpin: float = 0.7
@@ -111,7 +112,7 @@ class MomentumConfig:
     
     # Cooldown
     cooldown_seconds: int = 30
-    min_signal_strength: float = 0.3
+    min_signal_strength: float = 0.45
 
 
 @dataclass
@@ -123,6 +124,7 @@ class MomentumPosition:
     entry_time: float
     tp1_filled: bool = False
     tp2_filled: bool = False
+    tp3_filled: bool = False
     sl_ratcheted: bool = False
     sl_price: float = 0.0
     # Limit orders for automated exits
@@ -230,7 +232,16 @@ class MomentumBot:
             return None
         
         side = MomentumSide.UP if spot_change > 0 else MomentumSide.DOWN
-        
+
+        # Price ceiling: don't chase a side that's already priced in.
+        # Above 0.78 there is little room to profit; the market has already moved.
+        if side == MomentumSide.UP and market.up_price > 0.78:
+            logger.debug("Momentum: UP price %.3f already high, skipping", market.up_price)
+            return None
+        if side == MomentumSide.DOWN and market.down_price > 0.78:
+            logger.debug("Momentum: DOWN price %.3f already high, skipping", market.down_price)
+            return None
+
         # Calculate divergence - how much spot moved vs Poly's reaction
         # We want to catch when spot moves but Poly hasn't fully reacted yet
         mid_price = market.mid_price
@@ -244,10 +255,12 @@ class MomentumBot:
             logger.debug("Momentum: divergence %.3f below threshold 0.01", divergence)
             return None
         
-        # Calculate confidence - primarily based on impulse strength
+        # Calculate confidence — impulse strength × VPIN toxicity penalty
+        # impulse_strength: 1.0 at threshold, scales up with larger moves
+        # vpin_factor: fully punitive — high toxicity blocks entries (was floored at 0.5)
         impulse_strength = min(1.0, abs(spot_change) / threshold)
-        vpin_factor = max(0.5, 1 - 0.5 * risk.vpin)  # Less punitive
-        
+        vpin_factor = max(0.1, 1 - risk.vpin)
+
         confidence = impulse_strength * vpin_factor
         
         if confidence < self.config.min_signal_strength:
@@ -669,7 +682,17 @@ class MomentumBot:
                 logger.info("Momentum TP2 TRIGGERED: entry=%.4f cur=%.4f", pos.entry_price, current_price)
                 pos.tp2_filled = True
                 return {"action": "sell", "size": pos.size * 0.35, "reason": "TP2"}
-        
+
+        # TP3 — absolute price level ≥ 0.90 — sell 100% immediately, no prerequisite
+        if not pos.tp3_filled and position_value >= 0.10:
+            if current_price >= self.config.tp3_price:
+                logger.info(
+                    "Momentum TP3 TRIGGERED (≥%.2f): cur=%.4f — selling 100%%",
+                    self.config.tp3_price, current_price,
+                )
+                pos.tp3_filled = True
+                return {"action": "sell", "size": pos.size, "reason": "TP3"}
+
         # Late window: mercy stop
         if market.time_to_expiry < 45:
             mercy_price = pos.entry_price * (1 - 0.30)  # 30% mercy
@@ -683,125 +706,164 @@ class MomentumBot:
             return {"action": "sell", "size": pos.size, "reason": "expiry"}
     
     async def close_position(self, reason: str = "manual", sell_size: Optional[float] = None) -> Dict[str, Any]:
-        """Close current position (full or partial)."""
+        """
+        Close current position (full or partial).
+
+        Retry strategy (mirrors strategies/base.py execute_sell):
+          1. Poll CLOB balance up to 3× before the first order attempt to
+             confirm tokens have settled from the entry FOK fill.
+          2. Retry the FOK up to MAX_CLOSE_ATTEMPTS times, dropping the
+             sell price by PRICE_STEP each attempt to chase liquidity.
+          3. On balance errors: refresh and wait progressively longer.
+          4. Force-clear after FORCE_CLEAR_CALLS consecutive fully-failed calls.
+        """
+        MAX_CLOSE_ATTEMPTS = 5   # retries per close_position() call
+        PRICE_STEP = 0.02        # drop sell price 2 ticks each retry
+        BALANCE_POLLS = 3        # CLOB balance polls before first order
+        FORCE_CLEAR_CALLS = 3    # fully-failed calls before force-clear
+
         if not self._position:
             return {"success": False, "reason": "no position"}
-        
-        # Check balance block cooldown
-        if time.time() < self._balance_block_until:
-            return {"success": False, "reason": "balance cooldown"}
-        
+
         # Wait for token settlement after recent entry (FOK fills need time)
         time_since_entry = time.time() - self._position.entry_time
         if time_since_entry < 3.0:
             wait_time = 3.0 - time_since_entry
-            logger.debug(f"Momentum: waiting {wait_time:.1f}s for token settlement")
+            logger.debug("Momentum: waiting %.1fs for token settlement", wait_time)
             await asyncio.sleep(wait_time)
-        
+
         market = self.state.get_market_data()
-        
+
         # Determine size to sell (default to full position)
         if sell_size is None:
             sell_size = self._position.size
-        
+
         # Round to 2 decimals (FOK requirement)
         sell_size = int(sell_size * 100) / 100.0
         if sell_size < 0.01:
             return {"success": False, "reason": "size too small"}
-        
-        # Determine side to close
+
         if self._position.side == MomentumSide.UP:
             token_id = market.token_id_up
-            side = "SELL"
-            # Use best bid for better FOK fill
             if market.up_bids:
-                price = market.up_bids[0][0]
+                initial_price = market.up_bids[0][0]
             else:
-                price = market.up_price
+                initial_price = market.up_price
         else:
             token_id = market.token_id_down
-            side = "SELL"  # Must SELL to close a DOWN position
-            # Use best bid for better FOK fill
             if market.down_bids:
-                price = market.down_bids[0][0]
+                initial_price = market.down_bids[0][0]
             else:
-                price = market.down_price
-        
-        try:
-            # Try FOK first, then FAK if it fails
-            order_type = "FOK"
-            result = await self.bot.place_order(
-                token_id=token_id,
-                price=price,
-                size=sell_size,
-                side=side,
-                order_type=order_type,
-            )
-            
-            # If FOK fails, try FAK for partial fill
-            if not result.success and "couldn't be fully filled" in result.message.lower():
-                order_type = "FAK"
-                result = await self.bot.place_order(
-                    token_id=token_id,
-                    price=price,
-                    size=sell_size,
-                    side=side,
-                    order_type=order_type,
-                )
-            
-            if result.success:
-                # PnL calculation: works same for UP and DOWN since we now
-                # BUY to open and SELL to close both positions
-                pnl = (price - self._position.entry_price) * sell_size
-                
-                if pnl > 0:
-                    self._wins_today += 1
-                self._realized_pnl += pnl
-                self._window_pnl   += pnl
-                
-                # Update position size (for partial sells)
-                self._position.size -= sell_size
-                self._failed_close_attempts = 0  # Reset on success
-                
-                # Clear position if fully sold
-                if self._position.size < 0.01:
-                    self._position = None
-                
-                pnl_str = f"+${pnl:.2f}" if pnl > 0 else f"-${abs(pnl):.2f}"
-                logger.info(f"==> MOMENTUM CLOSED: {reason.upper()} | {sell_size:.2f}sh @ {price:.4f} | PnL: {pnl_str}")
-                
-                return {"success": True, "pnl": pnl}
-            else:
-                # Any close failure - increment counter
-                self._failed_close_attempts += 1
-                
-                # Check for balance/allowance error
-                if result.message and ("balance" in result.message.lower() or "allowance" in result.message.lower()):
-                    self._balance_block_until = time.time() + 3
-                    logger.warning("Momentum close: balance error, attempt %d", self._failed_close_attempts)
-                else:
-                    logger.warning("Momentum close: FOK failed (%s), attempt %d", result.message, self._failed_close_attempts)
-                
-                # Force clear after 5 failed attempts — cancel GTC orders first (P0-5)
-                if self._failed_close_attempts >= 5:
-                    logger.error("Momentum: force clearing position after 5 failed close attempts")
-                    if self._position:
-                        await self._cancel_all_exit_orders(self._position)
-                    self._position = None
-                    self._failed_close_attempts = 0
+                initial_price = market.down_price
 
-                return {"success": False, "reason": result.message}
-
-        except Exception as e:
-            logger.error("Momentum close failed: %s", e)
+        # Pre-flight: empty token_id means market rotated; bail immediately
+        if not token_id:
+            msg = f"no token_id for {self._position.side.value} (market rotated?)"
+            logger.error("==> MOMENTUM CLOSE FAILED: %s | attempt %d | reason: %s",
+                         reason.upper(), self._failed_close_attempts + 1, msg)
             self._failed_close_attempts += 1
-            if self._failed_close_attempts >= 5:
-                logger.error("Momentum: force clearing position after 5 failed close attempts")
+            if self._failed_close_attempts >= FORCE_CLEAR_CALLS:
                 if self._position:
                     await self._cancel_all_exit_orders(self._position)
                 self._position = None
                 self._failed_close_attempts = 0
-            return {"success": False, "reason": str(e)}
+            return {"success": False, "reason": msg}
+
+        if initial_price <= 0:
+            msg = f"price={initial_price:.4f} (no bids + stale mid)"
+            logger.error("==> MOMENTUM CLOSE FAILED: %s | attempt %d | reason: %s",
+                         reason.upper(), self._failed_close_attempts + 1, msg)
+            self._failed_close_attempts += 1
+            if self._failed_close_attempts >= FORCE_CLEAR_CALLS:
+                if self._position:
+                    await self._cancel_all_exit_orders(self._position)
+                self._position = None
+                self._failed_close_attempts = 0
+            return {"success": False, "reason": msg}
+
+        # ── Phase 1: poll CLOB balance until tokens are visible ──────────────
+        for poll in range(BALANCE_POLLS):
+            try:
+                await self.bot.update_balance_allowance("CONDITIONAL", token_id)
+                bal = await self.bot.get_balance_allowance("CONDITIONAL", token_id)
+                if bal and float(bal.get("balance", 0)) > 0:
+                    break
+            except Exception:
+                pass
+            if poll < BALANCE_POLLS - 1:
+                logger.debug("Momentum close: CLOB balance empty, waiting 3s (poll %d/%d)",
+                             poll + 1, BALANCE_POLLS)
+                await asyncio.sleep(3.0)
+
+        # ── Phase 2: retry loop with price widening ───────────────────────────
+        for attempt in range(MAX_CLOSE_ATTEMPTS):
+            sell_price = max(0.01, initial_price - attempt * PRICE_STEP)
+
+            try:
+                result = await self.bot.place_order(
+                    token_id=token_id,
+                    price=sell_price,
+                    size=sell_size,
+                    side="SELL",
+                    order_type="FOK",
+                )
+            except Exception as e:
+                logger.error("==> MOMENTUM CLOSE FAILED: %s | attempt %d | reason: exception — %s",
+                             reason.upper(), attempt + 1, e)
+                await asyncio.sleep(1.0)
+                continue
+
+            if result.success:
+                pnl = (sell_price - self._position.entry_price) * sell_size
+                if pnl > 0:
+                    self._wins_today += 1
+                self._realized_pnl += pnl
+                self._window_pnl   += pnl
+                self._position.size -= sell_size
+                self._failed_close_attempts = 0
+                if self._position.size < 0.01:
+                    self._position = None
+                pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+                if attempt > 0:
+                    logger.info("Momentum close: filled on attempt %d @ %.4f (slippage %.4f)",
+                                attempt + 1, sell_price, initial_price - sell_price)
+                logger.info("==> MOMENTUM CLOSED: %s | %.2fsh @ %.4f | PnL: %s",
+                            reason.upper(), sell_size, sell_price, pnl_str)
+                return {"success": True, "pnl": pnl}
+
+            err_msg = result.message or "unknown"
+
+            if "balance" in err_msg.lower() or "allowance" in err_msg.lower():
+                wait = 5.0 + attempt * 5.0
+                logger.warning("Momentum close: balance not settled (attempt %d), refreshing + %.0fs wait",
+                                attempt + 1, wait)
+                try:
+                    await self.bot.update_balance_allowance("CONDITIONAL", token_id)
+                except Exception:
+                    pass
+                await asyncio.sleep(wait)
+                continue
+
+            if "fill" in err_msg.lower() or "fok" in err_msg.lower():
+                logger.debug("Momentum close: FOK not filled @ %.4f (attempt %d), retrying lower",
+                             sell_price, attempt + 1)
+                continue
+
+            logger.warning("Momentum close: unknown error (attempt %d): %s", attempt + 1, err_msg)
+            await asyncio.sleep(0.5)
+
+        # ── All attempts exhausted for this call ──────────────────────────────
+        self._failed_close_attempts += 1
+        logger.error("==> MOMENTUM CLOSE FAILED: %s | attempt %d | reason: all %d retries exhausted",
+                     reason.upper(), self._failed_close_attempts, MAX_CLOSE_ATTEMPTS)
+        if self._failed_close_attempts >= FORCE_CLEAR_CALLS:
+            logger.error("==> MOMENTUM CLOSE FAILED: %s | FORCE CLEAR after %d calls",
+                         reason.upper(), FORCE_CLEAR_CALLS)
+            if self._position:
+                await self._cancel_all_exit_orders(self._position)
+            self._position = None
+            self._failed_close_attempts = 0
+        return {"success": False, "reason": f"all {MAX_CLOSE_ATTEMPTS} retries exhausted"}
     
     def get_stats(self) -> Dict[str, Any]:
         """Get bot statistics."""

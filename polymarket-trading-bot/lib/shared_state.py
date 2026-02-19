@@ -107,17 +107,20 @@ class SharedState:
         self._market = MarketData()
         self._risk = RiskMetrics()
         self._lock = asyncio.Lock()
-        
+
         # Price history for calculations
         self._price_history: Deque = deque(maxlen=1000)
         self._volume_buckets: Deque = deque(maxlen=10)  # For VPIN
         self._cancel_history: Deque = deque(maxlen=50)
-        
+
         # Spot price history
         self._spot_history: Deque = deque(maxlen=120)  # 2 minutes at 1s intervals
         self._spot_ewma: float = 0.0
         self._ewma_alpha: float = 0.1
-        
+
+        # Edge signal (set by EdgeAgent, read by coordinator)
+        self._edge_signal = None   # Optional[EdgeSignal] — avoid circular import
+
         # Running state
         self._running = False
     
@@ -131,11 +134,19 @@ class SharedState:
         """Get current risk metrics."""
         return self._risk
     
+    def get_edge_signal(self):
+        """Return the latest EdgeSignal from the EdgeAgent, or None."""
+        return self._edge_signal
+
+    def set_edge_signal(self, signal) -> None:
+        """Called by EdgeAgent to publish its latest finding."""
+        self._edge_signal = signal
+
     async def start(self):
         """Start the shared state service."""
         self._running = True
         logger.info("Shared state service started")
-    
+
     async def stop(self):
         """Stop the shared state service."""
         self._running = False

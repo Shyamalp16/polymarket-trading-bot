@@ -149,7 +149,7 @@ class MarketManager:
     def __init__(
         self,
         coin: str = "BTC",
-        market_check_interval: float = 30.0,
+        market_check_interval: float = 10.0,
         auto_switch_market: bool = True,
         market_duration: int = 15,
     ):
@@ -403,14 +403,38 @@ class MarketManager:
             return False
 
         self._ws_task = asyncio.create_task(self._run_websocket())
-        # Warm up cache so strategy loop has fresh data
-        has_data = await self.wait_for_data(timeout=6.0)
+        # Warm up cache so strategy loop has fresh data.
+        # 3 s is plenty for a healthy WS connection; the caller retries on False.
+        has_data = await self.wait_for_data(timeout=3.0)
         return has_data
+
+    def _poll_interval(self) -> float:
+        """
+        Return the adaptive polling interval based on time to expiry.
+
+        Normal window  → poll every ``market_check_interval`` s (default 10 s).
+        Last 60 s      → 5 s  (starting to watch)
+        Last 20 s      → 1 s  (market about to end)
+        Already ended  → 0.5 s (hammer until new market appears)
+        """
+        if not self.current_market:
+            return 2.0
+        mins, secs = self.current_market.get_countdown()
+        if mins < 0:
+            return self.market_check_interval
+        remaining = mins * 60 + secs
+        if remaining <= 0:
+            return 0.5    # Market ended — find new one ASAP
+        if remaining <= 20:
+            return 1.0    # Ending imminently
+        if remaining <= 60:
+            return 5.0    # Ending soon, increase vigilance
+        return self.market_check_interval
 
     async def _market_check_loop(self) -> None:
         """Periodically check for market changes."""
         while self._running:
-            await asyncio.sleep(self.market_check_interval)
+            await asyncio.sleep(self._poll_interval())
 
             if not self._running:
                 break
@@ -444,8 +468,8 @@ class MarketManager:
             self._update_current_market(market)
             restarted = await self._restart_websocket()
             if not restarted:
-                # One immediate retry can recover from transient WS race conditions.
-                await asyncio.sleep(0.5)
+                # Retry immediately — transient WS race condition; short pause then try again.
+                await asyncio.sleep(0.25)
                 await self._restart_websocket()
 
             # Fire market change callbacks in main thread
@@ -511,7 +535,7 @@ class MarketManager:
 
         self._ws_connected = False
 
-    async def wait_for_data(self, timeout: float = 5.0) -> bool:
+    async def wait_for_data(self, timeout: float = 3.0) -> bool:
         """
         Wait for WebSocket to connect and receive data.
 

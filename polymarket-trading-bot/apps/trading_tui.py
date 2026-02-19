@@ -161,6 +161,21 @@ _PATS: list[tuple] = [
 
     # MR escalating to taker
     (re.compile(r"MR: escalating to taker"), "MR", "ESCALATE"),
+
+    # ==> MR CLOSE FAILED: SL | attempt 2 | reason: no token_id ...
+    (re.compile(
+        r"==> MR CLOSE FAILED: (\w+) \| attempt (\d+) \| reason: (.+)"
+     ), "MR", "ERROR"),
+
+    # ==> MOMENTUM CLOSE FAILED: SL | attempt 2 | reason: ...
+    (re.compile(
+        r"==> MOMENTUM CLOSE FAILED: (\w+) \| attempt (\d+) \| reason: (.+)"
+     ), "MOM", "ERROR"),
+
+    # ==> MOMENTUM CLOSE FAILED: SL | FORCE CLEAR after 5 attempts
+    (re.compile(
+        r"==> MOMENTUM CLOSE FAILED: (\w+) \| (FORCE CLEAR.+)"
+     ), "MOM", "ERROR"),
 ]
 
 
@@ -183,6 +198,8 @@ class TradingEventCapture(logging.Handler):
         self.events: list[TEvent] = []
         self.session_pnl: float = 0.0
         self.window_pnl: float = 0.0
+        # Errors persist across market resets so they're never lost
+        self.errors: list[TEvent] = []
 
     # ── logging.Handler interface ─────────────────────────────────────────────
 
@@ -193,6 +210,11 @@ class TradingEventCapture(logging.Handler):
                 # New window → clear the per-window log and reset window PnL
                 self.events.clear()
                 self.window_pnl = 0.0
+            # Errors go into a separate sticky list that never clears
+            if ev.etype == "ERROR":
+                self.errors.insert(0, ev)
+                if len(self.errors) > 20:   # cap at 20 to avoid unbounded growth
+                    self.errors.pop()
             # Prepend so index-0 is always the most recent event
             self.events.insert(0, ev)
             if ev.pnl is not None:
@@ -250,6 +272,17 @@ class TradingEventCapture(logging.Handler):
                     label = "TP1 ratcheted → BE" if "TP1" in msg else "TP2 ratcheted → TP1"
                 return TEvent(etype="RATCHET", bot=bot, side="--", detail=label)
 
+            if etype == "ERROR":
+                if len(g) == 3:
+                    trigger, attempt, reason = g
+                    detail = f"{trigger} attempt {attempt}: {reason.strip()}"
+                elif len(g) == 2:
+                    trigger, detail_raw = g
+                    detail = f"{trigger} {detail_raw.strip()}"
+                else:
+                    detail = " ".join(str(x) for x in g)
+                return TEvent(etype="ERROR", bot=bot, side="--", detail=detail)
+
         return None
 
 
@@ -267,6 +300,7 @@ _ICONS = {
     "MAKER":    ("◷", C.CYN),
     "ESCALATE": ("↑", C.YLW),
     "RATCHET":  ("↗", C.GRN),
+    "ERROR":    ("✖", C.RED),
 }
 
 
@@ -511,6 +545,23 @@ class TradingTUI:
         )
         lines.append(_ruler())
 
+        # ── Sticky error panel — persists across market resets ────────────────────
+        if self.capture.errors:
+            lines.append(
+                _c(C.B + C.RED, " ✖ CLOSE FAILURES")
+                + _c(C.DIM, "  (persist across markets — most recent first)")
+            )
+            max_d = _W - 36
+            for ev in self.capture.errors[:5]:   # show latest 5
+                ts_s   = datetime.fromtimestamp(ev.ts).strftime("%H:%M:%S")
+                bot_col = C.CYN if ev.bot == "MOM" else C.MAG
+                bot_str = _c(bot_col, f"{ev.bot:<3}")
+                detail  = ev.detail
+                if len(_vis(detail)) > max_d:
+                    detail = detail[:max_d] + "…"
+                lines.append(f"  {_c(C.DIM, ts_s)}  {_c(C.RED, '✖')} {bot_str} {_c(C.RED, detail)}")
+            lines.append(_ruler())
+
         # ── Event log — all events for this window ────────────────────────────────
         n_ev = len(self.capture.events)
         ev_plural = "s" if n_ev != 1 else ""
@@ -582,9 +633,11 @@ class TradingTUI:
             lines.append(f"{'Entry':<10} {pos.entry_price:.4f}  size {pos.size:.1f}sh")
             tp1 = pos.entry_price * (1 + self.mom.config.tp1_pct)
             tp2 = pos.entry_price * (1 + self.mom.config.tp2_pct)
+            tp3 = self.mom.config.tp3_price
             lines.append(
                 f"{'TP1':<10} {tp1:.4f} {'✓' if pos.tp1_filled else '○'}"
                 f"  TP2 {tp2:.4f} {'✓' if pos.tp2_filled else '○'}"
+                f"  TP3 {tp3:.2f} {'✓' if pos.tp3_filled else '○'}"
             )
             peak = getattr(pos, '_peak_price', pos.entry_price)
             sl_trailed = pos.tp1_filled and pos.sl_price > pos.entry_price
@@ -621,9 +674,11 @@ class TradingTUI:
             lines.append(f"{'Entry':<10} {pos.entry_price:.4f}  size {pos.size:.1f}sh")
             tp1 = pos.entry_price * (1 + self.mr.config.tp1_pct)
             tp2 = pos.entry_price * (1 + self.mr.config.tp2_pct)
+            tp3 = self.mr.config.tp3_price
             lines.append(
                 f"{'TP1':<10} {tp1:.4f} {'✓' if pos.tp1_filled else '○'}"
                 f"  TP2 {tp2:.4f} {'✓' if pos.tp2_filled else '○'}"
+                f"  TP3 {tp3:.2f} {'✓' if pos.tp3_filled else '○'}"
             )
             peak = getattr(pos, '_peak_price', pos.entry_price)
             sl_trailed = pos.tp1_filled and pos.sl_price > pos.entry_price

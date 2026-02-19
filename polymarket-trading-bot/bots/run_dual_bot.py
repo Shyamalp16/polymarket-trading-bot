@@ -41,6 +41,7 @@ from src.websocket_client import MarketWebSocket
 from lib.shared_state import SharedState
 from lib.btc_price import BTCPriceTracker
 from lib.market_manager import MarketManager
+from lib.edge_agent import EdgeAgent, EdgeConfig
 
 from bots.momentum_bot import MomentumBot, MomentumConfig
 from bots.mean_reversion_bot import MeanReversionBot, MeanReversionConfig
@@ -89,11 +90,15 @@ class DualBotRunner:
         self.momentum_bot: MomentumBot = None
         self.mean_reversion_bot: MeanReversionBot = None
         self.coordinator: Coordinator = None
-        
+
+        # Edge agent
+        self.edge_agent: EdgeAgent = None
+
         # Tasks
         self._ws_task: asyncio.Task = None
         self._btc_task: asyncio.Task = None
         self._coordination_task: asyncio.Task = None
+        self._edge_task: asyncio.Task = None
         self._running = False
     
     async def initialize(self):
@@ -196,7 +201,18 @@ class DualBotRunner:
             self.shared_state,
             coord_config,
         )
-        
+
+        # Initialize edge agent
+        edge_config = EdgeConfig(
+            min_edge=0.05,
+            min_confidence=0.35,
+            scan_interval=3.0,
+            momentum_weight=0.18,
+            impulse_weight=0.08,
+            ob_weight=0.10,
+        )
+        self.edge_agent = EdgeAgent(self.shared_state, self.btc_price, edge_config)
+
         # Initialize market manager (5-minute markets)
         self.market_manager = MarketManager(coin=self.args.coin, market_duration=5)
         
@@ -239,15 +255,18 @@ class DualBotRunner:
         
         # Start coordinator
         await self.coordinator.start()
-        
+
+        # Start edge agent
+        await self.edge_agent.start()
+
         # Start background tasks
         self._ws_task = asyncio.create_task(self._market_update_loop())
-        
+
         if self.btc_price:
             self._btc_task = asyncio.create_task(self._btc_update_loop())
-        
+
         self._coordination_task = asyncio.create_task(self._coordination_loop())
-        
+
         logger.info("Dual-bot system started")
     
     async def stop(self):
@@ -255,17 +274,17 @@ class DualBotRunner:
         self._running = False
         
         # Cancel tasks
-        if self._ws_task:
-            self._ws_task.cancel()
-        if self._btc_task:
-            self._btc_task.cancel()
-        if self._coordination_task:
-            self._coordination_task.cancel()
-        
+        for task in (self._ws_task, self._btc_task, self._coordination_task, self._edge_task):
+            if task:
+                task.cancel()
+
         # Stop components
+        if self.edge_agent:
+            await self.edge_agent.stop()
+
         if self.market_manager:
             await self.market_manager.stop()
-        
+
         if self.btc_price:
             await self.btc_price.stop()
         await self.shared_state.stop()
@@ -375,12 +394,20 @@ class DualBotRunner:
                     btc    = self.btc_price.get_price() if self.btc_price else 0
                     mom_pos = "LONG" if self.momentum_bot.has_position else "idle"
                     mr_pos  = "LONG" if self.mean_reversion_bot.has_position else "idle"
+
+                    edge_sig = self.edge_agent.get_current_signal() if self.edge_agent else None
+                    edge_str = (
+                        f"EDGE {edge_sig.side.upper()} {edge_sig.edge*100:+.1f}% "
+                        f"(model={edge_sig.model_prob:.2f} mkt={edge_sig.market_prob:.2f})"
+                        if edge_sig else "no edge"
+                    )
+
                     logger.info(
                         "Heartbeat | BTC $%.0f spot2s=%+.3f%% regime=%s "
-                        "VPIN=%.2f frag=%.2f expiry=%ds | MOM=%s MR=%s",
+                        "VPIN=%.2f frag=%.2f expiry=%ds | MOM=%s MR=%s | %s",
                         btc, spot2 * 100, regime,
                         risk.vpin, risk.fragility, market.time_to_expiry,
-                        mom_pos, mr_pos,
+                        mom_pos, mr_pos, edge_str,
                     )
 
                 await asyncio.sleep(0.25)  # P3-5: coordination: 4 Hz (faster than data feeds)

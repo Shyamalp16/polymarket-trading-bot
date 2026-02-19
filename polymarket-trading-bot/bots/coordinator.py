@@ -352,6 +352,17 @@ class Coordinator:
             logger.debug("Momentum: already has position")
             return None
 
+        # Block if MR is already holding the same direction — prevents both bots
+        # stacking the same side and doubling concentration risk.
+        if (
+            self.mean_reversion.has_position
+            and self.mean_reversion.position.side.value == signal.side.value
+        ):
+            logger.debug(
+                "Momentum: blocked — MR already long %s", signal.side.value.upper()
+            )
+            return None
+
         # Per-bot entry cap — the main configurable knob (default: 1 per window)
         if self._window and self._window.momentum_entries >= self.config.max_momentum_entries:
             logger.debug(
@@ -414,6 +425,17 @@ class Coordinator:
             return None
         if self.mean_reversion._pending_maker_order:
             logger.debug("MR: maker order pending — skipping new entry")
+            return None
+
+        # Block if momentum is already holding the same direction — prevents both
+        # bots stacking the same side and doubling concentration risk.
+        if (
+            self.momentum.has_position
+            and self.momentum.position.side.value == signal.side.value
+        ):
+            logger.debug(
+                "MR: blocked — Momentum already long %s", signal.side.value.upper()
+            )
             return None
 
         # Block in impulse window unless maker price is sufficiently inside mid
