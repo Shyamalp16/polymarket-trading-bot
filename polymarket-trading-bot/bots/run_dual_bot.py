@@ -219,17 +219,6 @@ class DualBotRunner:
             spread_bot=self.spread_bot,
         )
 
-        # Initialize edge agent
-        edge_config = EdgeConfig(
-            min_edge=0.05,
-            min_confidence=0.35,
-            scan_interval=3.0,
-            momentum_weight=0.18,
-            impulse_weight=0.08,
-            ob_weight=0.10,
-        )
-        self.edge_agent = EdgeAgent(self.shared_state, self.btc_price, edge_config)
-
         # Initialize market manager (5-minute markets)
         self.market_manager = MarketManager(coin=self.args.coin, market_duration=5)
         
@@ -272,9 +261,6 @@ class DualBotRunner:
         
         # Start coordinator
         await self.coordinator.start()
-
-        # Start edge agent
-        await self.edge_agent.start()
 
         # Start background tasks
         self._ws_task = asyncio.create_task(self._market_update_loop())
