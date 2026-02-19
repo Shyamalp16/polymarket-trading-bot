@@ -92,9 +92,6 @@ class DualBotRunner:
         self.spread_bot: SpreadBot = None
         self.coordinator: Coordinator = None
 
-        # Edge agent
-        self.edge_agent: EdgeAgent = None
-
         # Tasks
         self._ws_task: asyncio.Task = None
         self._btc_task: asyncio.Task = None
