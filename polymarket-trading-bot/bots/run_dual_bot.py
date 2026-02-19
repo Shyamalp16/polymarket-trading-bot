@@ -41,8 +41,6 @@ from src.websocket_client import MarketWebSocket
 from lib.shared_state import SharedState
 from lib.btc_price import BTCPriceTracker
 from lib.market_manager import MarketManager
-from lib.edge_agent import EdgeAgent, EdgeConfig
-
 from bots.momentum_bot import MomentumBot, MomentumConfig
 from bots.mean_reversion_bot import MeanReversionBot, MeanReversionConfig
 from bots.coordinator import Coordinator, CoordinatorConfig
