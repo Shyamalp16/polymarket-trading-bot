@@ -101,6 +101,7 @@ class MomentumConfig:
     tp1_pct: float = 0.14              # +14%
     tp2_pct: float = 0.28              # +28%
     initial_sl_pct: float = 0.35       # -35%
+    trailing_sl_pct: float = 0.15      # trail 15% below peak — activates after TP1
     time_confirm_sl: float = 10.0       # seconds - no SL in first 10s
     early_exit_vpin: float = 0.7
     early_exit_spot_reversal: float = 0.0015  # 0.15% reversal
@@ -413,42 +414,20 @@ class MomentumBot:
                     logger.debug(f"Momentum: could not cancel order {oid}: {e}")
 
     async def _place_exit_limit_orders(self, pos: MomentumPosition, tp1_price: float, tp2_price: float):
-        """Place GTC take-profit limit orders after entry.
+        """No resting exit orders are placed.
 
-        SL is intentionally NOT placed as a resting order — a GTC SELL at a
-        price below the current market fills immediately at the best bid rather
-        than waiting for a price drop.  Stop-loss is enforced by the
-        _check_exit() price-level monitor (FOK on threshold breach).
+        GTC exit orders are incompatible with close_position() architecture:
+        when a GTC order fills on the exchange, calling close_position() again
+        double-sells the same tokens, causing wrong position tracking and missed PnL.
+
+        All exits (TP1, TP2, SL, mercy, expiry) are handled entirely by the
+        _check_exit() price-level monitor running at 4 Hz.
         """
-        try:
-            market = self.state.get_market_data()
-            token_id = market.token_id_up if pos.side == MomentumSide.UP else market.token_id_down
-            side = "SELL"
-
-            tp1_price_r = round(tp1_price * 1.01, 4)  # 1% buffer above TP threshold
-            tp2_price_r = round(tp2_price * 1.01, 4)
-
-            logger.info(f"Momentum: placing TP orders for {pos.size} shares @ entry {pos.entry_price:.3f} | TP1={tp1_price_r:.3f} TP2={tp2_price_r:.3f}")
-
-            tp1_result, tp2_result = await asyncio.gather(
-                self.bot.place_order(token_id=token_id, price=tp1_price_r, size=pos.size * 0.35, side=side, order_type="GTC"),
-                self.bot.place_order(token_id=token_id, price=tp2_price_r, size=pos.size * 0.35, side=side, order_type="GTC"),
-                return_exceptions=True,
-            )
-
-            if not isinstance(tp1_result, Exception) and tp1_result.success:
-                pos.tp1_order_id = tp1_result.order_id
-                logger.info(f"Momentum: TP1 order {tp1_result.order_id} @ {tp1_price_r:.3f} (35%)")
-            else:
-                logger.warning(f"Momentum: TP1 order failed: {tp1_result}")
-            if not isinstance(tp2_result, Exception) and tp2_result.success:
-                pos.tp2_order_id = tp2_result.order_id
-                logger.info(f"Momentum: TP2 order {tp2_result.order_id} @ {tp2_price_r:.3f} (35%)")
-            else:
-                logger.warning(f"Momentum: TP2 order failed: {tp2_result}")
-
-        except Exception as e:
-            logger.error(f"Momentum: failed to place exit limit orders: {e}")
+        logger.info(
+            "Momentum: position active — price-level exits armed | "
+            "TP1=%.3f (35%%)  TP2=%.3f (35%%)  SL=%.3f  size=%.2fsh",
+            tp1_price, tp2_price, pos.sl_price, pos.size,
+        )
     
     async def _cancel_remaining_orders(self, pos: MomentumPosition, reason: str):
         """Cancel remaining limit orders after one fills."""
@@ -642,70 +621,54 @@ class MomentumBot:
             self._last_logged_pnl = pnl_pct
             self._last_log_time = now
         
-        # --- Fallback price-level exits ---
-        # Primary path: limit orders placed via _place_exit_limit_orders.
-        # Fallback fires when:
-        #   (a) limit order ID is None  → order was never placed / failed silently, OR
-        #   (b) price has been past the level for >_TP_STALE_SECS → limit order exists but
-        #       its fill was missed by the polling loop (API lag, wrong status string, etc.)
-        _TP_STALE_SECS = 20  # seconds a price must sit past a level before we override
+        # ── Trailing SL ──────────────────────────────────────────────────────────
+        # Track peak price since entry
+        if not hasattr(pos, '_peak_price'):
+            pos._peak_price = pos.entry_price  # type: ignore[attr-defined]
+        pos._peak_price = max(pos._peak_price, current_price)  # type: ignore[attr-defined]
 
+        # Floor SL from initial config
+        floor_sl = pos.entry_price * (1 - self.config.initial_sl_pct)
+
+        # After TP1 fires: activate trailing SL at (peak × (1 − trail_pct)),
+        # minimum = entry price (break-even).  SL only ever moves UP.
+        if pos.tp1_filled:
+            trail_sl = max(pos.entry_price, pos._peak_price * (1 - self.config.trailing_sl_pct))  # type: ignore[attr-defined]
+            new_sl = max(pos.sl_price, floor_sl, trail_sl)
+        else:
+            new_sl = max(pos.sl_price, floor_sl)
+
+        if new_sl > pos.sl_price + 0.0001:
+            logger.info(
+                "Momentum: SL ratcheted %.4f → %.4f%s (peak=%.4f)",
+                pos.sl_price, new_sl,
+                " [TRAIL]" if pos.tp1_filled else "",
+                pos._peak_price,  # type: ignore[attr-defined]
+            )
+        pos.sl_price = new_sl
+
+        # ── Price-level exits ─────────────────────────────────────────────────
         tp1_threshold = pos.entry_price * (1 + self.config.tp1_pct)
         tp2_threshold = pos.entry_price * (1 + self.config.tp2_pct)
 
-        # Track how long price has been past each level
-        if not hasattr(pos, '_tp1_above_since'):
-            pos._tp1_above_since = None  # type: ignore[attr-defined]
-        if not hasattr(pos, '_tp2_above_since'):
-            pos._tp2_above_since = None  # type: ignore[attr-defined]
-        if not hasattr(pos, '_sl_below_since'):
-            pos._sl_below_since = None  # type: ignore[attr-defined]
-
-        _now = time.time()
-
         # SL
         if current_price <= pos.sl_price and position_value >= 0.10:
-            if pos._sl_below_since is None:
-                pos._sl_below_since = _now  # type: ignore[attr-defined]
-            sl_stale = pos.sl_order_id is not None and (_now - pos._sl_below_since) > _TP_STALE_SECS
-            if pos.sl_order_id is None or sl_stale:
-                if sl_stale:
-                    logger.warning("Momentum SL OVERRIDE: limit order stale — price below SL for >%ds", _TP_STALE_SECS)
-                return {"action": "sell", "size": pos.size, "reason": "SL"}
-        else:
-            pos._sl_below_since = None  # type: ignore[attr-defined]
+            logger.warning("Momentum SL TRIGGERED: entry=%.4f sl=%.4f cur=%.4f", pos.entry_price, pos.sl_price, current_price)
+            return {"action": "sell", "size": pos.size, "reason": "SL"}
 
         # TP1
         if not pos.tp1_filled and position_value >= 0.10:
             if current_price >= tp1_threshold:
-                if pos._tp1_above_since is None:
-                    pos._tp1_above_since = _now  # type: ignore[attr-defined]
-                tp1_stale = pos.tp1_order_id is not None and (_now - pos._tp1_above_since) > _TP_STALE_SECS
-                if pos.tp1_order_id is None or tp1_stale:
-                    if tp1_stale:
-                        logger.warning("Momentum TP1 OVERRIDE: limit order stale — price above TP1 for >%ds", _TP_STALE_SECS)
-                    else:
-                        logger.warning("Momentum TP1 TRIGGERED (fallback): entry=%.3f cur=%.3f", pos.entry_price, current_price)
-                    pos.tp1_filled = True
-                    return {"action": "sell", "size": pos.size * 0.35, "reason": "TP1"}
-            else:
-                pos._tp1_above_since = None  # type: ignore[attr-defined]
+                logger.info("Momentum TP1 TRIGGERED: entry=%.4f cur=%.4f", pos.entry_price, current_price)
+                pos.tp1_filled = True
+                return {"action": "sell", "size": pos.size * 0.35, "reason": "TP1"}
 
-        # TP2
-        if not pos.tp2_filled and position_value >= 0.10:
+        # TP2 — only after TP1 has already fired
+        if pos.tp1_filled and not pos.tp2_filled and position_value >= 0.10:
             if current_price >= tp2_threshold:
-                if pos._tp2_above_since is None:
-                    pos._tp2_above_since = _now  # type: ignore[attr-defined]
-                tp2_stale = pos.tp2_order_id is not None and (_now - pos._tp2_above_since) > _TP_STALE_SECS
-                if pos.tp2_order_id is None or tp2_stale:
-                    if tp2_stale:
-                        logger.warning("Momentum TP2 OVERRIDE: limit order stale — price above TP2 for >%ds", _TP_STALE_SECS)
-                    else:
-                        logger.warning("Momentum TP2 TRIGGERED (fallback): entry=%.3f cur=%.3f", pos.entry_price, current_price)
-                    pos.tp2_filled = True
-                    return {"action": "sell", "size": pos.size * 0.35, "reason": "TP2"}
-            else:
-                pos._tp2_above_since = None  # type: ignore[attr-defined]
+                logger.info("Momentum TP2 TRIGGERED: entry=%.4f cur=%.4f", pos.entry_price, current_price)
+                pos.tp2_filled = True
+                return {"action": "sell", "size": pos.size * 0.35, "reason": "TP2"}
         
         # Late window: mercy stop
         if market.time_to_expiry < 45:
@@ -805,7 +768,7 @@ class MomentumBot:
                     self._position = None
                 
                 pnl_str = f"+${pnl:.2f}" if pnl > 0 else f"-${abs(pnl):.2f}"
-                logger.info(f"==> MOMENTUM CLOSED: {reason.upper()} | {sell_size:.2f} shares | PnL: {pnl_str}")
+                logger.info(f"==> MOMENTUM CLOSED: {reason.upper()} | {sell_size:.2f}sh @ {price:.4f} | PnL: {pnl_str}")
                 
                 return {"success": True, "pnl": pnl}
             else:

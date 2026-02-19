@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -117,14 +118,14 @@ _PATS: list[tuple] = [
         r" \| TP1: ([\d.]+) TP2: ([\d.]+) SL: ([\d.]+)"
      ), "MR", "ENTRY"),
 
-    # ==> MOMENTUM CLOSED: TP1 | 3.50 shares | PnL: +$0.22
+    # ==> MOMENTUM CLOSED: TP1 | 3.50sh @ 0.4840 | PnL: +$0.22
     (re.compile(
-        r"==> MOMENTUM CLOSED: (\w+) \| ([\d.]+) shares \| PnL: ([+\-\$\d.]+)"
+        r"==> MOMENTUM CLOSED: (\w+) \| ([\d.]+)sh @ ([\d.]+) \| PnL: ([+\-\$\d.]+)"
      ), "MOM", "EXIT"),
 
-    # ==> MR CLOSED: SL | 10.00 shares | PnL: -$1.12
+    # ==> MR CLOSED: SL | 10.00sh @ 0.2910 | PnL: -$1.12
     (re.compile(
-        r"==> MR CLOSED: (\w+) \| ([\d.]+) shares \| PnL: ([+\-\$\d.]+)"
+        r"==> MR CLOSED: (\w+) \| ([\d.]+)sh @ ([\d.]+) \| PnL: ([+\-\$\d.]+)"
      ), "MR", "EXIT"),
 
     # ==> MOMENTUM SIGNAL: UP | conf=85% | impulse 0.20%
@@ -143,11 +144,15 @@ _PATS: list[tuple] = [
     # Coordinator: entering late window (45s remaining, 15.0% of window)
     (re.compile(r"Coordinator: entering late window \((.+)\)"), "SYS", "SYSTEM"),
 
-    # Ratchet notifications
+    # Ratchet / trailing SL notifications
     (re.compile(r"Momentum: TP1 done"), "MOM", "RATCHET"),
     (re.compile(r"Momentum: TP2 done"), "MOM", "RATCHET"),
     (re.compile(r"MR: TP1 done"),       "MR",  "RATCHET"),
     (re.compile(r"MR: TP2 done"),       "MR",  "RATCHET"),
+    # SL ratcheted (trailing SL update)
+    (re.compile(
+        r"(?:Momentum|MR): SL ratcheted ([\d.]+) → ([\d.]+)(\s*\[TRAIL\])?"
+     ), "BOT", "RATCHET"),
 
     # ==> MR MAKER POSTED: DOWN | 10.00 shares @ 0.445
     (re.compile(
@@ -209,12 +214,12 @@ class TradingEventCapture(logging.Handler):
                 return TEvent(etype="ENTRY", bot=bot, side=side, detail=detail)
 
             if etype == "EXIT":
-                reason, shares, pnl_raw = g
+                reason, shares, price, pnl_raw = g
                 try:
                     pnl = float(pnl_raw.replace("$", "").replace("+", ""))
                 except ValueError:
                     pnl = 0.0
-                detail = f"{reason:<6} {shares}sh  pnl={pnl_raw}"
+                detail = f"{reason:<6} {shares}sh @ {price}  pnl={pnl_raw}"
                 return TEvent(etype="EXIT", bot=bot, side="--", detail=detail, pnl=pnl)
 
             if etype == "SIGNAL":
@@ -237,7 +242,12 @@ class TradingEventCapture(logging.Handler):
                 return TEvent(etype="ESCALATE", bot="MR", side="--", detail="maker → taker")
 
             if etype == "RATCHET":
-                label = "TP1 ratcheted → BE" if "TP1" in msg else "TP2 ratcheted → TP1"
+                if len(g) == 3 and g[0]:
+                    # Trailing SL ratchet: groups = (old_sl, new_sl, "[TRAIL]"?)
+                    trail_tag = " [TSL]" if g[2] else ""
+                    label = f"SL {g[0]} → {g[1]}{trail_tag}"
+                else:
+                    label = "TP1 ratcheted → BE" if "TP1" in msg else "TP2 ratcheted → TP1"
                 return TEvent(etype="RATCHET", bot=bot, side="--", detail=label)
 
         return None
@@ -293,12 +303,20 @@ class TradingTUI:
         self.btc      = btc_tracker
         self.interval = refresh_interval
         self._running = False
+        self._kb_thread: Optional[threading.Thread] = None
+        # Brief status message shown in the footer after a local-clear action
+        self._notify_msg: str = ""
+        self._notify_ts:  float = 0.0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
         import asyncio
         self._running = True
+        self._kb_thread = threading.Thread(
+            target=self._keyboard_loop, daemon=True, name="tui-keyboard"
+        )
+        self._kb_thread.start()
         while self._running:
             try:
                 self._render()
@@ -308,6 +326,92 @@ class TradingTUI:
 
     def stop(self) -> None:
         self._running = False
+
+    # ── Keyboard listener (runs in background thread) ─────────────────────────
+
+    def _keyboard_loop(self) -> None:
+        """
+        Poll for single-character keypresses without blocking the render loop.
+        No terminal mode is changed on Windows; on Unix setcbreak is used.
+        Errors are swallowed — the keyboard listener is purely optional.
+        """
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                while self._running:
+                    if msvcrt.kbhit():
+                        raw = msvcrt.getch()
+                        # Extended / arrow keys arrive as two bytes; skip both.
+                        if raw in (b"\x00", b"\xe0"):
+                            msvcrt.getch()
+                            continue
+                        try:
+                            key = raw.decode("utf-8", errors="ignore").lower()
+                        except Exception:
+                            continue
+                        self._handle_key(key)
+                    time.sleep(0.05)
+            else:
+                import select
+                import termios
+                import tty
+                fd = sys.stdin.fileno()
+                old = termios.tcgetattr(fd)
+                try:
+                    tty.setcbreak(fd)
+                    while self._running:
+                        r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                        if r:
+                            self._handle_key(sys.stdin.read(1).lower())
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass  # keyboard listener is optional
+
+    def _handle_key(self, key: str) -> None:
+        if key == "1":
+            self._local_clear("A")
+        elif key == "2":
+            self._local_clear("B")
+        elif key == "0":
+            self._local_clear("A")
+            self._local_clear("B")
+
+    def _local_clear(self, which: str) -> None:
+        """
+        Wipe the bot's in-memory position state.
+
+        *** NO orders are sent to Polymarket. ***
+        This is purely a local state reset — useful when you manually
+        closed a trade on Polymarket and want the bot to stop tracking it.
+        """
+        cleared: list[str] = []
+
+        if which == "A":
+            if self.mom._position is not None:
+                side = self.mom._position.side.value.upper()
+                self.mom._position = None
+                cleared.append(f"BotA pos ({side})")
+
+        elif which == "B":
+            if self.mr._position is not None:
+                side = self.mr._position.side.value.upper()
+                self.mr._position = None
+                cleared.append(f"BotB pos ({side})")
+            if self.mr._pending_maker_order is not None:
+                self.mr._pending_maker_order = None
+                cleared.append("BotB maker order")
+
+        msg = ("LOCAL CLEAR: " + ", ".join(cleared)) if cleared else "LOCAL CLEAR: nothing to clear"
+        self._notify_msg = msg
+        self._notify_ts  = time.time()
+
+        self.capture.events.insert(0, TEvent(
+            etype="SYSTEM",
+            bot="SYS",
+            side="--",
+            detail=msg,
+        ))
 
     # ── Top-level render ──────────────────────────────────────────────────────
 
@@ -436,7 +540,23 @@ class TradingTUI:
                 )
 
         lines.append(_ruler("═"))
-        lines.append(_c(C.DIM, "  Ctrl+C to stop"))
+
+        # Show brief flash notification for 3 s after a local-clear action
+        if self._notify_msg and (time.time() - self._notify_ts) < 3.0:
+            lines.append(
+                _c(C.YLW + C.B, f"  ⚡ {self._notify_msg}")
+            )
+        else:
+            self._notify_msg = ""
+
+        lines.append(
+            _c(C.DIM, "  Ctrl+C stop")
+            + "  "
+            + _c(C.B + C.YLW, "[1]") + _c(C.DIM, " clear BotA  ")
+            + _c(C.B + C.YLW, "[2]") + _c(C.DIM, " clear BotB  ")
+            + _c(C.B + C.YLW, "[0]") + _c(C.DIM, " clear All")
+            + _c(C.DIM, "  (local only — no trades sent)")
+        )
 
         sys.stdout.write("\033[H\033[J" + "\n".join(lines) + "\n")
         sys.stdout.flush()
@@ -466,7 +586,10 @@ class TradingTUI:
                 f"{'TP1':<10} {tp1:.4f} {'✓' if pos.tp1_filled else '○'}"
                 f"  TP2 {tp2:.4f} {'✓' if pos.tp2_filled else '○'}"
             )
-            lines.append(f"{'SL':<10} {pos.sl_price:.4f}")
+            peak = getattr(pos, '_peak_price', pos.entry_price)
+            sl_trailed = pos.tp1_filled and pos.sl_price > pos.entry_price
+            sl_tag = _c(C.YLW, " [TSL]") if sl_trailed else ""
+            lines.append(f"{'SL':<10} {pos.sl_price:.4f}{sl_tag}  peak {peak:.4f}")
             lines.append(f"{'Unreal PnL':<10} {_pnl(unreal)}  ({_pct(unreal_pct)})")
             lines.append(f"{'Real PnL':<10} {_pnl(self.mom._realized_pnl)}  (win {_pnl(self.mom._window_pnl)})")
         else:
@@ -502,7 +625,10 @@ class TradingTUI:
                 f"{'TP1':<10} {tp1:.4f} {'✓' if pos.tp1_filled else '○'}"
                 f"  TP2 {tp2:.4f} {'✓' if pos.tp2_filled else '○'}"
             )
-            lines.append(f"{'SL':<10} {pos.sl_price:.4f}")
+            peak = getattr(pos, '_peak_price', pos.entry_price)
+            sl_trailed = pos.tp1_filled and pos.sl_price > pos.entry_price
+            sl_tag = _c(C.YLW, " [TSL]") if sl_trailed else ""
+            lines.append(f"{'SL':<10} {pos.sl_price:.4f}{sl_tag}  peak {peak:.4f}")
             lines.append(f"{'Unreal PnL':<10} {_pnl(unreal)}  ({_pct(unreal_pct)})")
             lines.append(f"{'Real PnL':<10} {_pnl(self.mr._realized_pnl)}  (win {_pnl(self.mr._window_pnl)})")
         elif pending:
