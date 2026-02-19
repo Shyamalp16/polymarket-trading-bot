@@ -80,8 +80,14 @@ class CoordinatorConfig:
     buffer_allocation: float = 0.20  # 20%
     
     # Per-window limits
-    max_entries_per_window: int = 2   # P1-8: strategy says 2 total per window
-    entry_cooldown: int = 60          # P1-9: 60s cooldown (strategy spec)
+    max_entries_per_window: int = 2   # shared total cap across both bots
+    # ── Per-bot entry caps (the main knob to turn) ──────────────────────────
+    # Set to 1 to allow at most one trade per bot per market window.
+    # Increase to 2 if you want the bot to add on a second signal.
+    max_momentum_entries: int = 1
+    max_mr_entries: int = 1
+    # ────────────────────────────────────────────────────────────────────────
+    entry_cooldown: int = 60          # seconds between entries for same bot
     cumulative_loss_budget_pct: float = 0.10  # 10% max loss per window
     
     # Conflict resolution
@@ -268,7 +274,9 @@ class Coordinator:
             self._window = WindowState(start_time=self._window_start)
             self._in_late_window = False
             self.momentum.reset_daily_stats()
+            self.momentum.reset_window_pnl()
             self.mean_reversion.reset_daily_stats()
+            self.mean_reversion.reset_window_pnl()
             logger.info(f"=== NEW MARKET: {self._last_token_id_up[:8]}... → {market.token_id_up[:8]}... ===")
 
         self._last_token_id_up = market.token_id_up
@@ -339,19 +347,22 @@ class Coordinator:
     async def _approve_momentum(self, signal, risk) -> Optional[Dict[str, Any]]:
         """Approve momentum entry with checks."""
 
-        # Check if already has position (per-bot check — P1-1 removes the shared gate)
+        # Already in a position
         if self.momentum.has_position:
             logger.debug("Momentum: already has position")
             return None
 
-        # P1-8: enforce shared total_entries cap (strategy: 2 total per window)
-        if self._window and self._window.total_entries >= self.config.max_entries_per_window:
-            logger.debug("Momentum: shared entry cap reached (%d)", self._window.total_entries)
+        # Per-bot entry cap — the main configurable knob (default: 1 per window)
+        if self._window and self._window.momentum_entries >= self.config.max_momentum_entries:
+            logger.debug(
+                "Momentum: per-bot entry cap reached (%d/%d)",
+                self._window.momentum_entries, self.config.max_momentum_entries,
+            )
             return None
 
-        # Per-bot entry limit (extra guard)
-        if self._window and self._window.momentum_entries >= self.config.max_entries_per_window:
-            logger.debug("Momentum: per-bot max entries reached")
+        # Shared total cap (both bots combined)
+        if self._window and self._window.total_entries >= self.config.max_entries_per_window:
+            logger.debug("Momentum: shared entry cap reached (%d)", self._window.total_entries)
             return None
 
         # Check cooldown
@@ -373,14 +384,16 @@ class Coordinator:
         if size < 5.0:
             return None
 
-        # Execute with size override
+        # Stamp attempt time immediately — cooldown fires even on failed FOK.
+        if self._window:
+            self._window.last_momentum_entry = time.time()
+
         result = await self.momentum.execute(signal, size_override=size)
 
         if result.get("success"):
             if self._window:
                 self._window.momentum_entries += 1
-                self._window.total_entries += 1  # P1-8
-                self._window.last_momentum_entry = time.time()
+                self._window.total_entries += 1
                 self._window.momentum_had_position = True
                 self._window.entries.append({
                     "bot": "momentum",
@@ -393,9 +406,14 @@ class Coordinator:
     async def _approve_mean_reversion(self, signal, risk, in_impulse_window: bool) -> Optional[Dict[str, Any]]:
         """Approve mean reversion entry with checks."""
 
-        # Check if already has position (per-bot check — P1-1 removes shared gate)
+        # Already in a position OR a maker order is resting (pending fill).
+        # Without the second check the coordinator would approve new entries every
+        # 250 ms loop while the GTX order waits to be lifted, causing 6+ buys.
         if self.mean_reversion.has_position:
             logger.debug("MR: already has position")
+            return None
+        if self.mean_reversion._pending_maker_order:
+            logger.debug("MR: maker order pending — skipping new entry")
             return None
 
         # Block in impulse window unless maker price is sufficiently inside mid
@@ -407,13 +425,17 @@ class Coordinator:
                 logger.debug("MR: blocked during impulse window (not maker)")
                 return None
 
-        # P1-8: enforce shared total_entries cap
-        if self._window and self._window.total_entries >= self.config.max_entries_per_window:
-            logger.debug("MR: shared entry cap reached (%d)", self._window.total_entries)
+        # Per-bot entry cap (default: 1 per window)
+        if self._window and self._window.mr_entries >= self.config.max_mr_entries:
+            logger.debug(
+                "MR: per-bot entry cap reached (%d/%d)",
+                self._window.mr_entries, self.config.max_mr_entries,
+            )
             return None
 
-        if self._window and self._window.mr_entries >= self.config.max_entries_per_window:
-            logger.debug("MR: per-bot max entries reached")
+        # Shared total cap
+        if self._window and self._window.total_entries >= self.config.max_entries_per_window:
+            logger.debug("MR: shared entry cap reached (%d)", self._window.total_entries)
             return None
 
         # Check cooldown
@@ -435,13 +457,16 @@ class Coordinator:
         if size < 5.0:
             return None
 
+        # Stamp attempt time immediately — cooldown fires even on failed GTX/FOK.
+        if self._window:
+            self._window.last_mr_entry = time.time()
+
         result = await self.mean_reversion.execute(signal, size_override=size)
 
         if result.get("success"):
             if self._window:
                 self._window.mr_entries += 1
-                self._window.total_entries += 1  # P1-8
-                self._window.last_mr_entry = time.time()
+                self._window.total_entries += 1
                 self._window.mr_had_position = True
                 self._window.entries.append({
                     "bot": "mean_reversion",
@@ -534,11 +559,12 @@ class Coordinator:
         return {
             "running": self._running,
             "window": {
-                "entries": len(self._window.entries) if self._window else 0,
+                "total_entries": self._window.total_entries if self._window else 0,
                 "momentum_entries": self._window.momentum_entries if self._window else 0,
                 "mr_entries": self._window.mr_entries if self._window else 0,
                 "losses": self._window.losses if self._window else 0,
             },
             "momentum": self.momentum.get_stats(),
             "mean_reversion": self.mean_reversion.get_stats(),
+            "in_late_window": self._in_late_window,
         }

@@ -46,10 +46,14 @@ from bots.momentum_bot import MomentumBot, MomentumConfig
 from bots.mean_reversion_bot import MeanReversionBot, MeanReversionConfig
 from bots.coordinator import Coordinator, CoordinatorConfig
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+# basicConfig may already have been called by an imported library, so configure
+# the root logger explicitly to guarantee our level and format take effect.
+_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+logging.basicConfig(format=_LOG_FORMAT)          # install handler if none exist
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+for _h in _root.handlers:
+    _h.setFormatter(logging.Formatter(_LOG_FORMAT))
 
 # Silence noisy loggers
 logging.getLogger("asyncio").setLevel(logging.WARNING)
@@ -59,6 +63,11 @@ logging.getLogger("src.websocket_client").setLevel(logging.ERROR)
 logging.getLogger("lib.market_manager").setLevel(logging.ERROR)
 logging.getLogger("src.client").setLevel(logging.ERROR)
 logging.getLogger("src.bot").setLevel(logging.WARNING)
+
+# Bot loggers default to INFO so DEBUG spam is hidden unless --log-level DEBUG
+logging.getLogger("bots.coordinator").setLevel(logging.INFO)
+logging.getLogger("bots.momentum_bot").setLevel(logging.INFO)
+logging.getLogger("bots.mean_reversion_bot").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -127,26 +136,39 @@ class DualBotRunner:
         momentum_config = MomentumConfig(
             bankroll=bankroll,
             max_position_pct=0.05,
-            spot_impulse_threshold=0.0020,  # P1-4: 0.20% (strategy spec)
-            high_vol_impulse=0.0018,        # 0.18% in high vol
-            low_vol_impulse=0.0025,         # 0.25% in low vol
-            cooldown_seconds=60,            # P1-9: unified 60s cooldown
-            min_signal_strength=0.4,
+            # Spot impulse — original 0.20% required a $130+ move in 2s (flash-crash
+            # level). Calibrated to typical "sharp" intraday BTC moves:
+            spot_impulse_threshold=0.0006,  # 0.06% NORMAL  (~$40 on $66k BTC)
+            high_vol_impulse=0.0004,        # 0.04% HIGH vol (easier entry)
+            low_vol_impulse=0.0008,         # 0.08% LOW vol  (stricter)
+            cooldown_seconds=60,
+            min_signal_strength=0.3,        # was 0.4 — confidence builds from spot strength
             tp1_pct=0.14,
             tp2_pct=0.28,
             initial_sl_pct=0.35,
         )
-        
+
         mr_config = MeanReversionConfig(
             bankroll=bankroll,
             max_position_pct=0.05,
-            min_drop=0.10,           # 10% (strategy spec)
-            z_threshold=2.5,         # P1-5: strategy spec
+            # Drop threshold — logs showed 7.1% peak drop vs 8% LOW threshold.
+            # Lowered to catch typical Poly dislocations (3-6% spikes are common):
+            min_drop=0.05,           # 5% NORMAL  (was 10%)
+            high_vol_drop=0.07,      # 7% HIGH vol (was 12%)
+            low_vol_drop=0.04,       # 4% LOW vol  (was 8%)
+            # z-score — 2.5 too strict for short 5m windows with thin history.
+            z_threshold=1.8,         # was 2.5
+            # OB support — (1 − imbalance) ≥ 0.40 instead of 0.60.
+            # Default imbalance = 0.5 → ob_support = 0.5, which used to always block.
+            ob_imbalance_threshold=0.40,
+            # Time gate — don't waste the last 60s of a window.
+            min_time_remaining=60,   # was 90s
             tp1_pct=0.22,
             tp2_pct=0.45,
             early_sl_pct=0.40,
             mid_sl_pct=0.35,
-            cooldown_seconds=60,     # P1-9: unified 60s cooldown
+            min_signal_strength=0.25,  # was 0.3
+            cooldown_seconds=60,
         )
         
         coord_config = CoordinatorConfig(
@@ -327,20 +349,40 @@ class DualBotRunner:
     
     async def _coordination_loop(self):
         """Main coordination loop."""
+        _last_heartbeat = 0.0
         while self._running:
             try:
                 # Check for entry signals
                 entry_result = await self.coordinator.check_and_coordinate()
-                
+
                 if entry_result and entry_result.get("success"):
                     logger.info("Entry executed: %s", entry_result)
-                
+
                 # Check for exits
                 await self.coordinator.check_exits()
-                
+
                 # Check late window
                 await self.coordinator.check_late_window()
-                
+
+                # Heartbeat every 30 s — one-line status summary at INFO
+                now = time.time()
+                if now - _last_heartbeat >= 30:
+                    _last_heartbeat = now
+                    risk   = self.shared_state.get_risk_metrics()
+                    market = self.shared_state.get_market_data()
+                    spot2  = risk.btc_spot_change_2s
+                    regime = risk.regime.value if hasattr(risk.regime, "value") else str(risk.regime)
+                    btc    = self.btc_price.get_price() if self.btc_price else 0
+                    mom_pos = "LONG" if self.momentum_bot.has_position else "idle"
+                    mr_pos  = "LONG" if self.mean_reversion_bot.has_position else "idle"
+                    logger.info(
+                        "Heartbeat | BTC $%.0f spot2s=%+.3f%% regime=%s "
+                        "VPIN=%.2f frag=%.2f expiry=%ds | MOM=%s MR=%s",
+                        btc, spot2 * 100, regime,
+                        risk.vpin, risk.fragility, market.time_to_expiry,
+                        mom_pos, mr_pos,
+                    )
+
                 await asyncio.sleep(0.25)  # P3-5: coordination: 4 Hz (faster than data feeds)
 
             except asyncio.CancelledError:
@@ -376,21 +418,60 @@ def main():
     parser.add_argument("--coin", default="BTC", help="Coin to trade (default: BTC)")
     parser.add_argument("--bankroll", type=float, default=100, help="Bankroll in USD (default: 100)")
     parser.add_argument("--log-level", default="INFO", help="Log level")
-    
+    parser.add_argument("--tui", action="store_true", help="Enable trading TUI (signal/PnL dashboard)")
+
     args = parser.parse_args()
-    
-    # Set log level
-    logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
-    
-    # Bot loggers - respect --log-level argument
-    bot_log_level = getattr(logging, args.log_level.upper(), logging.INFO)
-    logging.getLogger("bots.coordinator").setLevel(bot_log_level)
-    logging.getLogger("bots.momentum_bot").setLevel(bot_log_level)
-    logging.getLogger("bots.mean_reversion_bot").setLevel(bot_log_level)
-    
+
+    # Honour --log-level flag: apply to root + bot loggers
+    level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.getLogger().setLevel(level)
+    for _name in ("bots.coordinator", "bots.momentum_bot", "bots.mean_reversion_bot"):
+        logging.getLogger(_name).setLevel(level)
+
     # Run
     runner = DualBotRunner(args)
-    asyncio.run(runner.run())
+    if args.tui:
+        _run_with_tui(runner)
+    else:
+        asyncio.run(runner.run())
+
+
+def _run_with_tui(runner: DualBotRunner) -> None:
+    """Entry point that injects the TUI render loop alongside the runner."""
+    import asyncio as _aio
+
+    async def _main():
+        from apps.trading_tui import TradingEventCapture, TradingTUI, install_tui_handler
+
+        await runner.initialize()
+        await runner.start()
+
+        # Install event capture AFTER startup so setup logs print normally
+        capture = TradingEventCapture()
+        install_tui_handler(capture)
+
+        tui = TradingTUI(
+            capture=capture,
+            shared_state=runner.shared_state,
+            coordinator=runner.coordinator,
+            momentum_bot=runner.momentum_bot,
+            mr_bot=runner.mean_reversion_bot,
+            btc_tracker=runner.btc_price,
+            refresh_interval=0.5,
+        )
+        tui_task = _aio.create_task(tui.run())
+
+        try:
+            while runner._running:
+                await _aio.sleep(10)
+        except KeyboardInterrupt:
+            logger.info("Shutting down…")
+        finally:
+            tui.stop()
+            tui_task.cancel()
+            await runner.stop()
+
+    _aio.run(_main())
 
 
 if __name__ == "__main__":
