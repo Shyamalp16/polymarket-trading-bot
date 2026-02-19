@@ -86,12 +86,12 @@ class MomentumConfig:
     kelly_multiplier: float = 0.25      # Kelly fraction
     
     # Entry triggers
-    spot_impulse_threshold: float = 0.0006  # 0.06% in 2s — typical sharp BTC move
+    spot_impulse_threshold: float = 0.0003  # 0.03% in 2s — catches normal BTC moves
     spot_impulse_window: int = 2            # seconds
 
     # Dynamic thresholds by regime — high vol LOWERS trigger, low vol RAISES it
-    high_vol_impulse: float = 0.0004   # 0.04% — easier entry in high vol
-    low_vol_impulse: float = 0.0008    # 0.08% — stricter entry in low vol
+    high_vol_impulse: float = 0.0002   # 0.02% — easier entry in high vol
+    low_vol_impulse: float = 0.0004    # 0.04% — stricter entry in low vol
     
     # Execution
     max_slippage_ticks: int = 4
@@ -112,7 +112,7 @@ class MomentumConfig:
     
     # Cooldown
     cooldown_seconds: int = 30
-    min_signal_strength: float = 0.45
+    min_signal_strength: float = 0.30
 
 
 @dataclass
@@ -159,7 +159,12 @@ class MomentumBot:
         self._entry_cooldown: float = 0
         self._balance_block_until: float = 0  # Cooldown after balance errors
         self._failed_close_attempts: int = 0  # Track failed close attempts
-        
+
+        # Entry lock — True while execute() is running (including taker retries).
+        # Prevents the coordinator from starting a second concurrent entry during
+        # the await sleeps inside execute().
+        self._entry_in_progress: bool = False
+
         # Signal history — bounded deque (P3-2)
         self._recent_signals: Deque[MomentumSignal] = deque(maxlen=100)
         
@@ -234,11 +239,11 @@ class MomentumBot:
         side = MomentumSide.UP if spot_change > 0 else MomentumSide.DOWN
 
         # Price ceiling: don't chase a side that's already priced in.
-        # Above 0.78 there is little room to profit; the market has already moved.
-        if side == MomentumSide.UP and market.up_price > 0.78:
+        # Above 0.85 there is little room to profit; the market has already moved.
+        if side == MomentumSide.UP and market.up_price > 0.85:
             logger.debug("Momentum: UP price %.3f already high, skipping", market.up_price)
             return None
-        if side == MomentumSide.DOWN and market.down_price > 0.78:
+        if side == MomentumSide.DOWN and market.down_price > 0.85:
             logger.debug("Momentum: DOWN price %.3f already high, skipping", market.down_price)
             return None
 
@@ -311,6 +316,21 @@ class MomentumBot:
             logger.debug("Momentum: blocked by balance cooldown")
             return {"success": False, "reason": "balance cooldown"}
 
+        # Block concurrent calls — retry sleeps inside the FOK loop yield the event
+        # loop back to the coordinator, which could approve another entry before the
+        # first one completes, producing orphaned fills.
+        if self._entry_in_progress:
+            logger.debug("Momentum: entry already in progress — blocking concurrent execute()")
+            return {"success": False, "reason": "entry in progress"}
+        self._entry_in_progress = True
+
+        try:
+            return await self._execute_inner(signal, size_override)
+        finally:
+            self._entry_in_progress = False
+
+    async def _execute_inner(self, signal: MomentumSignal, size_override: Optional[float] = None) -> Dict[str, Any]:
+        """Inner execute — called exclusively from execute() which holds the entry lock."""
         # Stamp attempt time so cooldown applies even on FOK rejection.
         self._last_entry_time = time.time()
 
@@ -427,20 +447,66 @@ class MomentumBot:
                     logger.debug(f"Momentum: could not cancel order {oid}: {e}")
 
     async def _place_exit_limit_orders(self, pos: MomentumPosition, tp1_price: float, tp2_price: float):
-        """No resting exit orders are placed.
+        """Place GTC limit orders for SL, TP1, and TP2 immediately after entry fills.
 
-        GTC exit orders are incompatible with close_position() architecture:
-        when a GTC order fills on the exchange, calling close_position() again
-        double-sells the same tokens, causing wrong position tracking and missed PnL.
+        All three are posted as resting GTC sell orders so they fill naturally
+        when price reaches each level — no FOK/FAK liquidity dependency.
 
-        All exits (TP1, TP2, SL, mercy, expiry) are handled entirely by the
-        _check_exit() price-level monitor running at 4 Hz.
+        Sizes:
+          SL  → full position (exits everything on a stop)
+          TP1 → 35 % of position
+          TP2 → 35 % of position
+          (remaining 30 % hold is managed by ratcheted orders after TP1 fires)
         """
+        await asyncio.sleep(3.0)  # Wait for tokens to settle after entry fill
+
+        if not self._position or self._position is not pos:
+            return  # position was cleared while waiting
+
+        market = self.state.get_market_data()
+        token_id = market.token_id_up if pos.side == MomentumSide.UP else market.token_id_down
+
+        if not token_id:
+            logger.warning("Momentum: cannot place exit orders — no token_id (market rotated?)")
+            return
+
+        tp1_size = round(pos.size * 0.35, 2)
+        tp2_size = round(pos.size * 0.35, 2)
+        sl_size  = round(pos.size, 2)
+
+        tp1_price_r = max(0.01, min(0.99, round(tp1_price, 4)))
+        tp2_price_r = max(0.01, min(0.99, round(tp2_price, 4)))
+        sl_price_r  = max(0.01, min(0.99, round(pos.sl_price, 4)))
+
         logger.info(
-            "Momentum: position active — price-level exits armed | "
-            "TP1=%.3f (35%%)  TP2=%.3f (35%%)  SL=%.3f  size=%.2fsh",
-            tp1_price, tp2_price, pos.sl_price, pos.size,
+            "Momentum: placing exit GTC orders | SL=%.4f x%.2f  TP1=%.4f x%.2f  TP2=%.4f x%.2f",
+            sl_price_r, sl_size, tp1_price_r, tp1_size, tp2_price_r, tp2_size,
         )
+
+        tp1_res, tp2_res, sl_res = await asyncio.gather(
+            self.bot.place_order(token_id=token_id, price=tp1_price_r, size=tp1_size, side="SELL", order_type="GTC"),
+            self.bot.place_order(token_id=token_id, price=tp2_price_r, size=tp2_size, side="SELL", order_type="GTC"),
+            self.bot.place_order(token_id=token_id, price=sl_price_r,  size=sl_size,  side="SELL", order_type="GTC"),
+            return_exceptions=True,
+        )
+
+        if not isinstance(tp1_res, Exception) and tp1_res.success:
+            pos.tp1_order_id = tp1_res.order_id
+            logger.info("Momentum: TP1 GTC resting @ %.4f x%.2f [%s]", tp1_price_r, tp1_size, tp1_res.order_id[:8])
+        else:
+            logger.warning("Momentum: TP1 GTC failed: %s", tp1_res)
+
+        if not isinstance(tp2_res, Exception) and tp2_res.success:
+            pos.tp2_order_id = tp2_res.order_id
+            logger.info("Momentum: TP2 GTC resting @ %.4f x%.2f [%s]", tp2_price_r, tp2_size, tp2_res.order_id[:8])
+        else:
+            logger.warning("Momentum: TP2 GTC failed: %s", tp2_res)
+
+        if not isinstance(sl_res, Exception) and sl_res.success:
+            pos.sl_order_id = sl_res.order_id
+            logger.info("Momentum: SL  GTC resting @ %.4f x%.2f [%s]", sl_price_r, sl_size, sl_res.order_id[:8])
+        else:
+            logger.warning("Momentum: SL GTC failed: %s", sl_res)
     
     async def _cancel_remaining_orders(self, pos: MomentumPosition, reason: str):
         """Cancel remaining limit orders after one fills."""
@@ -463,7 +529,37 @@ class MomentumBot:
                     logger.info(f"Momentum: cancelled {order_id} after {reason}")
                 except Exception as e:
                     logger.debug(f"Momentum: failed to cancel order {order_id}: {e}")
-    
+
+    def _handle_gtc_exit_fill(self, size: float, reason: str, fill_price: float) -> Dict[str, Any]:
+        """Update position tracking after a GTC exit order confirmed filled on the exchange.
+
+        Called by the coordinator when already_filled=True so we never call
+        close_position() and double-sell tokens that are already gone.
+        """
+        if not self._position:
+            return {"success": False, "reason": "no position"}
+
+        pos = self._position
+        pnl = (fill_price - pos.entry_price) * size
+        self._realized_pnl += pnl
+        self._window_pnl   += pnl
+        if pnl > 0:
+            self._wins_today += 1
+
+        remaining = round(pos.size - size, 2)
+        if remaining <= 0.01:
+            self._position = None
+            self._failed_close_attempts = 0
+        else:
+            pos.size = remaining
+
+        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        logger.info(
+            "==> MOMENTUM GTC EXIT: %s | %.2fsh @ %.4f | PnL: %s | remaining: %.2fsh",
+            reason.upper(), size, fill_price, pnl_str, max(0.0, remaining),
+        )
+        return {"success": True, "pnl": pnl}
+
     async def _check_limit_orders(self, pos: MomentumPosition) -> Optional[Dict[str, Any]]:
         """Check if any limit orders have been filled.
 
@@ -490,7 +586,10 @@ class MomentumBot:
                         oid = pos.sl_order_id
                         pos.sl_order_id = None  # P0-4: clear immediately to prevent re-detection
                         await self._cancel_remaining_orders(pos, "SL")
-                        return {"action": "sell", "size": filled_size, "reason": "SL", "order_id": oid}
+                        return {
+                            "action": "sell", "size": filled_size, "reason": "SL", "order_id": oid,
+                            "already_filled": True, "fill_price": pos.sl_price,
+                        }
 
             # Check TP1 order — ratchet: sell 35%, new TP2 higher, SL at break-even
             if pos.tp1_order_id:
@@ -535,7 +634,11 @@ class MomentumBot:
                             pos.sl_ratcheted = True
 
                         logger.info(f"Momentum: TP1 done — new TP2 @ {new_tp2_price:.3f}, SL @ break-even")
-                        return {"action": "sell", "size": filled_size, "reason": "TP1", "order_id": oid}
+                        tp1_fill_price = round(pos.entry_price * (1 + self.config.tp1_pct), 4)
+                        return {
+                            "action": "sell", "size": filled_size, "reason": "TP1", "order_id": oid,
+                            "already_filled": True, "fill_price": tp1_fill_price,
+                        }
 
             # Check TP2 order — let remainder ride, move SL to TP1 price
             if pos.tp2_order_id:
@@ -573,7 +676,11 @@ class MomentumBot:
                             pos.sl_order_id = new_sl.order_id
 
                         logger.info(f"Momentum: TP2 done — hold riding with SL @ {tp1_price:.3f}")
-                        return {"action": "sell", "size": filled_size, "reason": "TP2", "order_id": oid}
+                        tp2_fill_price = round(pos.entry_price * (1 + self.config.tp2_pct), 4)
+                        return {
+                            "action": "sell", "size": filled_size, "reason": "TP2", "order_id": oid,
+                            "already_filled": True, "fill_price": tp2_fill_price,
+                        }
 
             return None
         except Exception as e:
@@ -664,20 +771,20 @@ class MomentumBot:
         tp1_threshold = pos.entry_price * (1 + self.config.tp1_pct)
         tp2_threshold = pos.entry_price * (1 + self.config.tp2_pct)
 
-        # SL
-        if current_price <= pos.sl_price and position_value >= 0.10:
+        # SL — skip if a resting GTC SL order is handling this level
+        if not pos.sl_order_id and current_price <= pos.sl_price and position_value >= 0.10:
             logger.warning("Momentum SL TRIGGERED: entry=%.4f sl=%.4f cur=%.4f", pos.entry_price, pos.sl_price, current_price)
             return {"action": "sell", "size": pos.size, "reason": "SL"}
 
-        # TP1
-        if not pos.tp1_filled and position_value >= 0.10:
+        # TP1 — skip if a resting GTC TP1 order is handling this level
+        if not pos.tp1_order_id and not pos.tp1_filled and position_value >= 0.10:
             if current_price >= tp1_threshold:
                 logger.info("Momentum TP1 TRIGGERED: entry=%.4f cur=%.4f", pos.entry_price, current_price)
                 pos.tp1_filled = True
                 return {"action": "sell", "size": pos.size * 0.35, "reason": "TP1"}
 
-        # TP2 — only after TP1 has already fired
-        if pos.tp1_filled and not pos.tp2_filled and position_value >= 0.10:
+        # TP2 — skip if a resting GTC TP2 order is handling this level
+        if not pos.tp2_order_id and pos.tp1_filled and not pos.tp2_filled and position_value >= 0.10:
             if current_price >= tp2_threshold:
                 logger.info("Momentum TP2 TRIGGERED: entry=%.4f cur=%.4f", pos.entry_price, current_price)
                 pos.tp2_filled = True
@@ -724,6 +831,11 @@ class MomentumBot:
 
         if not self._position:
             return {"success": False, "reason": "no position"}
+
+        # Cancel any resting GTC exit orders before FAK-selling to prevent double-sells
+        # (mercy stop, expiry close, and TP3 all bypass GTC and use FAK directly)
+        if self._position.sl_order_id or self._position.tp1_order_id or self._position.tp2_order_id:
+            await self._cancel_all_exit_orders(self._position)
 
         # Wait for token settlement after recent entry (FOK fills need time)
         time_since_entry = time.time() - self._position.entry_time
@@ -795,17 +907,27 @@ class MomentumBot:
                              poll + 1, BALANCE_POLLS)
                 await asyncio.sleep(3.0)
 
-        # ── Phase 2: retry loop with price widening ───────────────────────────
+        # ── Phase 2: retry loop — FAK with partial-fill tracking ─────────────
+        # FAK (Fill-And-Kill) fills whatever depth exists at the price level and
+        # cancels the rest.  This guarantees progress every attempt even when the
+        # book is thin — unlike FOK which fails all-or-nothing and leaves you
+        # stuck at -50% while retrying the same full size each time.
+        remaining = sell_size
+        total_pnl = 0.0
+
         for attempt in range(MAX_CLOSE_ATTEMPTS):
+            if remaining < 0.01:
+                break  # Fully closed by earlier partial fills
+
             sell_price = max(0.01, initial_price - attempt * PRICE_STEP)
 
             try:
                 result = await self.bot.place_order(
                     token_id=token_id,
                     price=sell_price,
-                    size=sell_size,
+                    size=remaining,
                     side="SELL",
-                    order_type="FOK",
+                    order_type="FAK",  # Partial fills allowed — always makes progress
                 )
             except Exception as e:
                 logger.error("==> MOMENTUM CLOSE FAILED: %s | attempt %d | reason: exception — %s",
@@ -814,22 +936,51 @@ class MomentumBot:
                 continue
 
             if result.success:
-                pnl = (sell_price - self._position.entry_price) * sell_size
+                # Query the confirmed fill amount via get_order().
+                # Polymarket's FAK POST response often returns size_matched=0 or
+                # omits it entirely even when shares were filled.  Using the POST
+                # response directly (with `or remaining` as fallback) causes a
+                # phantom close — bot clears _position but no trade happened.
+                filled = 0.0
+                if result.order_id:
+                    try:
+                        order_data = await self.bot.get_order(result.order_id)
+                        raw = (order_data or {}).get("size_matched") or (order_data or {}).get("sizeMatched") or 0
+                        filled = float(raw)
+                    except Exception as e:
+                        logger.warning("Momentum close: get_order failed after FAK (attempt %d): %s", attempt + 1, e)
+
+                filled = min(filled, remaining)
+
+                if filled < 0.01:
+                    logger.debug("Momentum close: FAK 0 fill confirmed @ %.4f (attempt %d), retrying lower",
+                                 sell_price, attempt + 1)
+                    continue
+
+                pnl = (sell_price - self._position.entry_price) * filled
+                total_pnl += pnl
                 if pnl > 0:
                     self._wins_today += 1
                 self._realized_pnl += pnl
                 self._window_pnl   += pnl
-                self._position.size -= sell_size
-                self._failed_close_attempts = 0
-                if self._position.size < 0.01:
-                    self._position = None
-                pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-                if attempt > 0:
-                    logger.info("Momentum close: filled on attempt %d @ %.4f (slippage %.4f)",
-                                attempt + 1, sell_price, initial_price - sell_price)
-                logger.info("==> MOMENTUM CLOSED: %s | %.2fsh @ %.4f | PnL: %s",
-                            reason.upper(), sell_size, sell_price, pnl_str)
-                return {"success": True, "pnl": pnl}
+                self._position.size -= filled
+                remaining -= filled
+
+                logger.info(
+                    "Momentum close: FAK filled %.2f/%.2f sh @ %.4f (attempt %d, remaining %.2f)",
+                    filled, sell_size, sell_price, attempt + 1, remaining,
+                )
+
+                if remaining < 0.01:
+                    self._failed_close_attempts = 0
+                    if self._position.size < 0.01:
+                        self._position = None
+                    pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+                    logger.info("==> MOMENTUM CLOSED: %s | %.2fsh | PnL: %s",
+                                reason.upper(), sell_size, pnl_str)
+                    return {"success": True, "pnl": total_pnl}
+
+                continue
 
             err_msg = result.message or "unknown"
 
@@ -844,17 +995,20 @@ class MomentumBot:
                 await asyncio.sleep(wait)
                 continue
 
-            if "fill" in err_msg.lower() or "fok" in err_msg.lower():
-                logger.debug("Momentum close: FOK not filled @ %.4f (attempt %d), retrying lower",
-                             sell_price, attempt + 1)
-                continue
-
-            logger.warning("Momentum close: unknown error (attempt %d): %s", attempt + 1, err_msg)
-            await asyncio.sleep(0.5)
+            logger.debug("Momentum close: FAK no fill @ %.4f (attempt %d), retrying lower",
+                         sell_price, attempt + 1)
 
         # ── All attempts exhausted for this call ──────────────────────────────
+        if remaining < sell_size:
+            if self._position and self._position.size < 0.01:
+                self._position = None
+            pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+            logger.error("==> MOMENTUM CLOSE PARTIAL: %s | sold %.2f/%.2f sh | PnL: %s | remaining %.2f",
+                         reason.upper(), sell_size - remaining, sell_size, pnl_str, remaining)
+            return {"success": False, "partial": True, "pnl": total_pnl, "remaining": remaining}
+
         self._failed_close_attempts += 1
-        logger.error("==> MOMENTUM CLOSE FAILED: %s | attempt %d | reason: all %d retries exhausted",
+        logger.error("==> MOMENTUM CLOSE FAILED: %s | attempt %d | reason: all %d retries exhausted (0 fills)",
                      reason.upper(), self._failed_close_attempts, MAX_CLOSE_ATTEMPTS)
         if self._failed_close_attempts >= FORCE_CLEAR_CALLS:
             logger.error("==> MOMENTUM CLOSE FAILED: %s | FORCE CLEAR after %d calls",

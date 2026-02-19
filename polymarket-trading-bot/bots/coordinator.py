@@ -48,6 +48,8 @@ from typing import Optional, Dict, Any, List
 from enum import Enum
 
 from lib.shared_state import SharedState, MarketRegime
+from bots.mean_reversion_bot import ReversionSide
+from bots.spread_bot import SpreadBot
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +77,10 @@ class CoordinatorConfig:
     
     # Capital allocation
     total_bankroll: float = 100.0
-    momentum_allocation: float = 0.40  # 40%
-    mean_reversion_allocation: float = 0.40  # 40%
-    buffer_allocation: float = 0.20  # 20%
+    momentum_allocation: float = 0.30      # 30%
+    mean_reversion_allocation: float = 0.30 # 30%
+    spread_allocation: float = 0.30        # 30%
+    buffer_allocation: float = 0.10        # 10%
     
     # Per-window limits
     max_entries_per_window: int = 2   # shared total cap across both bots
@@ -116,11 +119,13 @@ class WindowState:
     losses: float = 0.0
     momentum_entries: int = 0
     mr_entries: int = 0
+    spread_entries: int = 0
     total_entries: int = 0  # P1-8: shared cap across both bots
     last_momentum_entry: float = 0
     last_mr_entry: float = 0
-    momentum_had_position: bool = False  # Track if position was held this window
-    mr_had_position: bool = False  # Track if position was held this window
+    momentum_had_position: bool = False
+    mr_had_position: bool = False
+    spread_attempted: bool = False
 
 
 class Coordinator:
@@ -141,15 +146,18 @@ class Coordinator:
         mean_reversion_bot, # MeanReversionBot instance
         shared_state: SharedState,
         config: CoordinatorConfig = None,
+        spread_bot: Optional[SpreadBot] = None,
     ):
         self.momentum = momentum_bot
         self.mean_reversion = mean_reversion_bot
+        self.spread = spread_bot   # Optional — None disables spread strategy
         self.state = shared_state
         self.config = config or CoordinatorConfig()
-        
+
         # Capital available per bot
         self._momentum_capital = self.config.total_bankroll * self.config.momentum_allocation
         self._mr_capital = self.config.total_bankroll * self.config.mean_reversion_allocation
+        self._spread_capital = self.config.total_bankroll * self.config.spread_allocation
         
         # Window state
         self._window: Optional[WindowState] = None
@@ -239,10 +247,40 @@ class Coordinator:
         if mr_signal:
             logger.info(f"==> MR SIGNAL: {mr_signal.side.value.upper()} | conf={mr_signal.confidence:.0%} | {mr_signal.reason}")
         
+        # ── SpreadBot: tick fill-monitor and exit-monitor every loop ─────────
+        # These run regardless of late-window state so fills and SL exits
+        # are always processed.  check_spread() handles its own time gate.
+        if self.spread:
+            fill_result = await self.spread.check_fills()
+            if fill_result and fill_result.get("success"):
+                logger.debug("Spread fill event: %s", fill_result)
+
+            exit_result = await self.spread.check_exit()
+            if exit_result and exit_result.get("success"):
+                logger.debug("Spread exit event: %s", exit_result)
+
+        # Expiry snipe — runs in last 5-30 s, bypasses the late-window block.
+        # Must be checked BEFORE the late-window gate so it can actually execute.
+        snipe = await self._check_expiry_snipe(market)
+        if snipe is not None:
+            return snipe
+
         # P2-8: block new entries during late window (mercy stops still handled per-bot)
         if self._in_late_window:
             logger.debug("Coordinator: blocking entry — late window")
             return None
+
+        # ── SpreadBot: attempt to post a new spread this window ──────────────
+        if self.spread and not self._window.spread_attempted:
+            spread_result = await self.spread.check_spread()
+            if spread_result and spread_result.get("success"):
+                if self._window:
+                    self._window.spread_entries  += 1
+                    self._window.total_entries   += 1
+                    self._window.spread_attempted = True
+                logger.info("==> SPREAD ACTIVE: UP @ %.3f  DOWN @ %.3f",
+                            spread_result.get("up_bid", 0), spread_result.get("down_bid", 0))
+                return spread_result
 
         # P1-1: DO NOT block both bots when only one has a position.
         # Each bot has its own capital pool; _approve_* checks has_position per-bot.
@@ -269,7 +307,14 @@ class Coordinator:
             return
 
         if self._window and self._last_token_id_up and market.token_id_up != self._last_token_id_up:
-            # Genuine new market — token IDs changed
+            # Genuine new market — token IDs changed.
+            # Cancel any resting GTX before resetting the window so the old order
+            # doesn't stay open in the CLOB while a new one is posted for the new
+            # market (which is what causes the two-open-orders symptom).
+            await self.mean_reversion.cancel_pending_maker()
+            if self.spread:
+                await self.spread.on_window_reset()
+
             self._window_start = time.time()
             self._window = WindowState(start_time=self._window_start)
             self._in_late_window = False
@@ -277,6 +322,8 @@ class Coordinator:
             self.momentum.reset_window_pnl()
             self.mean_reversion.reset_daily_stats()
             self.mean_reversion.reset_window_pnl()
+            if self.spread:
+                self.spread.reset_window_pnl()
             logger.info(f"=== NEW MARKET: {self._last_token_id_up[:8]}... → {market.token_id_up[:8]}... ===")
 
         self._last_token_id_up = market.token_id_up
@@ -289,6 +336,80 @@ class Coordinator:
         elapsed = time.time() - self._window.last_momentum_entry
         return elapsed < self.config.impulse_priority_window
     
+    async def _check_expiry_snipe(self, market) -> Optional[Dict[str, Any]]:
+        """
+        Expiry snipe: in the final 5–30 seconds, if one side has settled to
+        85 ¢+, buy it for the near-certain $1.00 resolution payout.
+
+        Wider window (30 s) and lower floor (85 ¢) vs the old 90–95 ¢ range:
+        - 85–89 ¢ entered at 30 s remaining: ~18% upside, market implying 85%+
+        - 90–94 ¢ entered at 15 s remaining: ~11% upside, near-certain
+        - 95 ¢+: skip — spread cost eats the edge and it's already fully priced
+
+        Conditions:
+        - 5 s ≤ time_to_expiry ≤ 30 s
+        - UP or DOWN price ≥ 0.85 and < 0.96 (above 96 ¢ margin too thin)
+        - MR bot must be free (no open position or in-progress entry)
+        """
+        tte = market.time_to_expiry
+        if not (5 <= tte <= 30):
+            return None
+
+        # Block only if MR bot itself is currently holding a position or mid-entry
+        if self.mean_reversion.has_position:
+            return None
+        if getattr(self.mean_reversion, "_entry_in_progress", False):
+            return None
+        if self.mean_reversion._pending_maker_order:
+            return None
+
+        up_p   = market.up_price
+        down_p = market.down_price
+
+        if 0.85 <= up_p < 0.96:
+            side      = ReversionSide.UP
+            token_id  = market.token_id_up
+            price     = up_p
+        elif 0.85 <= down_p < 0.96:
+            side      = ReversionSide.DOWN
+            token_id  = market.token_id_down
+            price     = down_p
+        else:
+            return None
+
+        if not token_id:
+            return None
+
+        # Snipe size: 7 shares — slightly larger than normal entries to make the
+        # near-certain resolution payout worth the FOK spread cost.
+        size = 7.0
+
+        logger.info(
+            "==> EXPIRY SNIPE: %s @ %.3f | %ds remaining | expect $1.00 resolution",
+            side.value.upper(), price, tte,
+        )
+
+        result = await self.mean_reversion.snipe_entry(
+            side=side,
+            token_id=token_id,
+            price=price,
+            size=size,
+            window_remaining=tte,
+        )
+
+        if result.get("success") and self._window:
+            self._window.mr_entries      += 1
+            self._window.total_entries   += 1
+            self._window.mr_had_position  = True
+            self._window.last_mr_entry    = time.time()
+            self._window.entries.append({
+                "bot": "snipe",
+                "side": side.value,
+                "time": time.time(),
+            })
+
+        return result
+
     async def _resolve_conflict(
         self,
         momentum_signal,
@@ -350,6 +471,12 @@ class Coordinator:
         # Already in a position
         if self.momentum.has_position:
             logger.debug("Momentum: already has position")
+            return None
+
+        # execute() is mid-flight (e.g. inside taker retry sleeps) — don't start
+        # a second concurrent entry that would produce orphaned fills.
+        if getattr(self.momentum, "_entry_in_progress", False):
+            logger.debug("Momentum: entry already in progress — skipping")
             return None
 
         # Block if MR is already holding the same direction — prevents both bots
@@ -425,6 +552,12 @@ class Coordinator:
             return None
         if self.mean_reversion._pending_maker_order:
             logger.debug("MR: maker order pending — skipping new entry")
+            return None
+
+        # execute() is mid-flight (e.g. taker retries after GTX rejection) — a
+        # second concurrent entry would produce fills the bot cannot track.
+        if getattr(self.mean_reversion, "_entry_in_progress", False):
+            logger.debug("MR: entry already in progress — skipping")
             return None
 
         # Block if momentum is already holding the same direction — prevents both
@@ -530,7 +663,13 @@ class Coordinator:
             bot = self.momentum if bot_type == BotType.MOMENTUM else self.mean_reversion
             had_position_before = bot.has_position
 
-            result = await bot.close_position(reason, sell_size=size)
+            if exit_data.get("already_filled"):
+                # GTC limit order already executed on the exchange — just update tracking.
+                # Do NOT call close_position() or we double-sell tokens already gone.
+                fill_price = exit_data.get("fill_price", 0.0)
+                result = bot._handle_gtc_exit_fill(size, reason, fill_price)
+            else:
+                result = await bot.close_position(reason, sell_size=size)
 
             if result.get("success"):
                 pnl = result.get("pnl", 0)
@@ -581,12 +720,14 @@ class Coordinator:
         return {
             "running": self._running,
             "window": {
-                "total_entries": self._window.total_entries if self._window else 0,
+                "total_entries":    self._window.total_entries    if self._window else 0,
                 "momentum_entries": self._window.momentum_entries if self._window else 0,
-                "mr_entries": self._window.mr_entries if self._window else 0,
-                "losses": self._window.losses if self._window else 0,
+                "mr_entries":       self._window.mr_entries       if self._window else 0,
+                "spread_entries":   self._window.spread_entries   if self._window else 0,
+                "losses":           self._window.losses           if self._window else 0,
             },
-            "momentum": self.momentum.get_stats(),
+            "momentum":      self.momentum.get_stats(),
             "mean_reversion": self.mean_reversion.get_stats(),
+            "spread":         self.spread.get_stats() if self.spread else {},
             "in_late_window": self._in_late_window,
         }

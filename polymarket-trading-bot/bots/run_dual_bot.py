@@ -46,6 +46,7 @@ from lib.edge_agent import EdgeAgent, EdgeConfig
 from bots.momentum_bot import MomentumBot, MomentumConfig
 from bots.mean_reversion_bot import MeanReversionBot, MeanReversionConfig
 from bots.coordinator import Coordinator, CoordinatorConfig
+from bots.spread_bot import SpreadBot, SpreadConfig
 
 # basicConfig may already have been called by an imported library, so configure
 # the root logger explicitly to guarantee our level and format take effect.
@@ -69,6 +70,7 @@ logging.getLogger("src.bot").setLevel(logging.WARNING)
 logging.getLogger("bots.coordinator").setLevel(logging.INFO)
 logging.getLogger("bots.momentum_bot").setLevel(logging.INFO)
 logging.getLogger("bots.mean_reversion_bot").setLevel(logging.INFO)
+logging.getLogger("bots.spread_bot").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,7 @@ class DualBotRunner:
         # Bots
         self.momentum_bot: MomentumBot = None
         self.mean_reversion_bot: MeanReversionBot = None
+        self.spread_bot: SpreadBot = None
         self.coordinator: Coordinator = None
 
         # Edge agent
@@ -178,28 +181,47 @@ class DualBotRunner:
         
         coord_config = CoordinatorConfig(
             total_bankroll=bankroll,
-            momentum_allocation=0.40,
-            mean_reversion_allocation=0.40,
-            buffer_allocation=0.20,
+            momentum_allocation=0.30,
+            mean_reversion_allocation=0.30,
+            spread_allocation=0.30,
+            buffer_allocation=0.10,
         )
-        
+
+        spread_config = SpreadConfig(
+            bankroll=bankroll,
+            size_per_leg=5.0,
+            min_time_remaining=120,   # only spread if ≥2 min left in window
+            target_low=0.44,          # spread when both sides near 50¢
+            target_high=0.56,
+            bid_offset=0.02,          # bid 2¢ below ask → maker pricing
+            single_leg_cancel_window=90,
+            single_leg_sl_pct=0.15,
+        )
+
         self.momentum_bot = MomentumBot(
             self.trading_bot,
             self.shared_state,
             momentum_config,
         )
-        
+
         self.mean_reversion_bot = MeanReversionBot(
             self.trading_bot,
             self.shared_state,
             mr_config,
         )
-        
+
+        self.spread_bot = SpreadBot(
+            self.trading_bot,
+            self.shared_state,
+            spread_config,
+        )
+
         self.coordinator = Coordinator(
             self.momentum_bot,
             self.mean_reversion_bot,
             self.shared_state,
             coord_config,
+            spread_bot=self.spread_bot,
         )
 
         # Initialize edge agent
@@ -452,7 +474,7 @@ def main():
     # Honour --log-level flag: apply to root + bot loggers
     level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.getLogger().setLevel(level)
-    for _name in ("bots.coordinator", "bots.momentum_bot", "bots.mean_reversion_bot"):
+    for _name in ("bots.coordinator", "bots.momentum_bot", "bots.mean_reversion_bot", "bots.spread_bot"):
         logging.getLogger(_name).setLevel(level)
 
     # Run
@@ -483,6 +505,7 @@ def _run_with_tui(runner: DualBotRunner) -> None:
             coordinator=runner.coordinator,
             momentum_bot=runner.momentum_bot,
             mr_bot=runner.mean_reversion_bot,
+            spread_bot=runner.spread_bot,
             btc_tracker=runner.btc_price,
             refresh_interval=0.5,
         )

@@ -167,9 +167,48 @@ _PATS: list[tuple] = [
         r"==> MR CLOSE FAILED: (\w+) \| attempt (\d+) \| reason: (.+)"
      ), "MR", "ERROR"),
 
+    # ==> MR CLOSE PARTIAL: SL | sold 2.00/5.00 sh | PnL: -$0.60 | remaining 3.00
+    (re.compile(
+        r"==> MR CLOSE PARTIAL: (\w+) \| sold ([\d.]+)/([\d.]+) sh \| PnL: ([+\-\$\d.]+) \| remaining ([\d.]+)"
+     ), "MR", "ERROR"),
+
     # ==> MOMENTUM CLOSE FAILED: SL | attempt 2 | reason: ...
     (re.compile(
         r"==> MOMENTUM CLOSE FAILED: (\w+) \| attempt (\d+) \| reason: (.+)"
+     ), "MOM", "ERROR"),
+
+    # ==> SPREAD POSTED: UP @ 0.480  DOWN @ 0.480 | 5 sh/leg | cost=4.80  locked=+0.20
+    (re.compile(
+        r"==> SPREAD POSTED: UP @ ([\d.]+)\s+DOWN @ ([\d.]+) \| (\d+) sh/leg"
+     ), "SPR", "ENTRY"),
+
+    # ==> SPREAD FILLED: UP @ 0.480  DOWN @ 0.480 | cost $4.80 | locked +$0.20
+    (re.compile(
+        r"==> SPREAD FILLED: UP @ ([\d.]+)\s+DOWN @ ([\d.]+) \| cost \$([\d.]+) \| locked \+\$([\d.]+)"
+     ), "SPR", "EXIT"),
+
+    # ==> SPREAD SINGLE LEG: UP @ 0.480 | 5 sh | SL 0.408
+    (re.compile(
+        r"==> SPREAD SINGLE LEG: (\w+) @ ([\d.]+) \| (\d+) sh \| SL ([\d.]+)"
+     ), "SPR", "SIGNAL"),
+
+    # ==> SPREAD CLOSED: SL | 5.00 sh | PnL: -$0.35
+    (re.compile(
+        r"==> SPREAD CLOSED: (\w+) \| ([\d.]+) sh \| PnL: ([+\-\$\d.]+)"
+     ), "SPR", "EXIT"),
+
+    # ==> SPREAD CLOSE FAILED / PARTIAL
+    (re.compile(r"==> SPREAD CLOSE FAILED: (.+)"), "SPR", "ERROR"),
+    (re.compile(r"==> SPREAD CLOSE PARTIAL: (.+)"), "SPR", "ERROR"),
+
+    # ==> EXPIRY SNIPE: UP @ 0.920 | 20s remaining | expect $1.00 resolution
+    (re.compile(
+        r"==> EXPIRY SNIPE: (\w+) @ ([\d.]+) \| (\d+)s remaining"
+     ), "SPR", "ENTRY"),
+
+    # ==> MOMENTUM CLOSE PARTIAL: SL | sold 2.00/5.00 sh | PnL: -$0.60 | remaining 3.00
+    (re.compile(
+        r"==> MOMENTUM CLOSE PARTIAL: (\w+) \| sold ([\d.]+)/([\d.]+) sh \| PnL: ([+\-\$\d.]+) \| remaining ([\d.]+)"
      ), "MOM", "ERROR"),
 
     # ==> MOMENTUM CLOSE FAILED: SL | FORCE CLEAR after 5 attempts
@@ -326,6 +365,7 @@ class TradingTUI:
         coordinator: "Coordinator",
         momentum_bot: "MomentumBot",
         mr_bot: "MeanReversionBot",
+        spread_bot: Optional["SpreadBot"] = None,
         btc_tracker: Optional["BTCPriceTracker"] = None,
         refresh_interval: float = 0.5,
     ):
@@ -334,6 +374,7 @@ class TradingTUI:
         self.coord    = coordinator
         self.mom      = momentum_bot
         self.mr       = mr_bot
+        self.spr      = spread_bot
         self.btc      = btc_tracker
         self.interval = refresh_interval
         self._running = False
@@ -407,9 +448,22 @@ class TradingTUI:
             self._local_clear("A")
         elif key == "2":
             self._local_clear("B")
+        elif key == "3":
+            self._local_clear("C")
         elif key == "0":
             self._local_clear("A")
             self._local_clear("B")
+            self._local_clear("C")
+        elif key == "c":
+            # Hard-clear the terminal buffer so stale output is fully gone.
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+            self._notify_msg = "Screen cleared"
+            self._notify_ts  = time.time()
+        elif key == "e":
+            self.capture.errors.clear()
+            self._notify_msg = "Error log cleared"
+            self._notify_ts  = time.time()
 
     def _local_clear(self, which: str) -> None:
         """
@@ -435,6 +489,14 @@ class TradingTUI:
             if self.mr._pending_maker_order is not None:
                 self.mr._pending_maker_order = None
                 cleared.append("BotB maker order")
+
+        elif which == "C" and self.spr is not None:
+            if self.spr._position is not None:
+                self.spr._position = None
+                cleared.append("BotC position")
+            if self.spr._legs is not None:
+                self.spr._legs = None
+                cleared.append("BotC pending legs")
 
         msg = ("LOCAL CLEAR: " + ", ".join(cleared)) if cleared else "LOCAL CLEAR: nothing to clear"
         self._notify_msg = msg
@@ -511,6 +573,12 @@ class TradingTUI:
 
         lines.append(_ruler())
 
+        # ── Spread panel (full width) ─────────────────────────────────────────
+        if self.spr is not None:
+            for l in self._spr_panel(market, risk):
+                lines.append(l)
+            lines.append(_ruler())
+
         # ── Market snapshot ───────────────────────────────────────────────────
         up_bid  = market.up_bids[0][0]   if market.up_bids   else 0.0
         up_ask  = market.up_asks[0][0]   if market.up_asks   else 0.0
@@ -518,12 +586,15 @@ class TradingTUI:
         dn_ask  = market.down_asks[0][0] if market.down_asks else 0.0
 
         # PnL read directly from bot objects (reliable — not log-parsed)
-        session_pnl = self.mom._realized_pnl + self.mr._realized_pnl
-        window_pnl  = self.mom._window_pnl   + self.mr._window_pnl
+        spr_rpnl    = self.spr._realized_pnl if self.spr else 0.0
+        spr_wpnl    = self.spr._window_pnl   if self.spr else 0.0
+        session_pnl = self.mom._realized_pnl + self.mr._realized_pnl + spr_rpnl
+        window_pnl  = self.mom._window_pnl   + self.mr._window_pnl   + spr_wpnl
 
         # Unrealized: only open positions contribute
         mom_pos = self.mom.position
         mr_pos  = self.mr.position
+        spr_pos = self.spr.position if self.spr else None
         unreal = 0.0
         if mom_pos:
             mpx = market.up_price if mom_pos.side.value == "up" else market.down_price
@@ -531,6 +602,12 @@ class TradingTUI:
         if mr_pos:
             mpx = market.up_price if mr_pos.side.value == "up" else market.down_price
             unreal += (mpx - mr_pos.entry_price) * mr_pos.size
+        if spr_pos and spr_pos.status != "spread":
+            # Single directional leg — calculate unrealized
+            if spr_pos.status == "long_up" and spr_pos.up_size > 0:
+                unreal += (market.up_price - spr_pos.up_entry) * spr_pos.up_size
+            elif spr_pos.status == "long_down" and spr_pos.down_size > 0:
+                unreal += (market.down_price - spr_pos.down_entry) * spr_pos.down_size
 
         lines.append(
             f" {_c(C.GRN,'UP')}  mid {market.up_price:.3f}"
@@ -542,6 +619,7 @@ class TradingTUI:
             f"  bid {dn_bid:.3f} / ask {dn_ask:.3f}"
             f"    │  Window  {_pnl(window_pnl)}"
             f"  mom {_pnl(self.mom._window_pnl)}  mr {_pnl(self.mr._window_pnl)}"
+            + (f"  spr {_pnl(spr_wpnl)}" if self.spr else "")
         )
         lines.append(_ruler())
 
@@ -554,7 +632,7 @@ class TradingTUI:
             max_d = _W - 36
             for ev in self.capture.errors[:5]:   # show latest 5
                 ts_s   = datetime.fromtimestamp(ev.ts).strftime("%H:%M:%S")
-                bot_col = C.CYN if ev.bot == "MOM" else C.MAG
+                bot_col = C.CYN if ev.bot == "MOM" else (C.MAG if ev.bot == "MR" else C.YLW)
                 bot_str = _c(bot_col, f"{ev.bot:<3}")
                 detail  = ev.detail
                 if len(_vis(detail)) > max_d:
@@ -579,7 +657,7 @@ class TradingTUI:
                 ts_s    = datetime.fromtimestamp(ev.ts).strftime("%H:%M:%S")
                 icon_ch, icon_col = _ICONS.get(ev.etype, ("·", C.DIM))
                 icon    = _c(icon_col, icon_ch)
-                bot_col = C.CYN if ev.bot == "MOM" else (C.MAG if ev.bot == "MR" else C.DIM)
+                bot_col = C.CYN if ev.bot == "MOM" else (C.MAG if ev.bot == "MR" else (C.YLW if ev.bot == "SPR" else C.DIM))
                 bot_str = _c(bot_col, f"{ev.bot:<3}")
                 etype_s = _c(_ICONS.get(ev.etype, ("·", C.DIM))[1], f"{ev.etype:<8}")
                 pnl_tag = f"  {_pnl(ev.pnl)}" if ev.pnl is not None else ""
@@ -603,9 +681,12 @@ class TradingTUI:
         lines.append(
             _c(C.DIM, "  Ctrl+C stop")
             + "  "
-            + _c(C.B + C.YLW, "[1]") + _c(C.DIM, " clear BotA  ")
-            + _c(C.B + C.YLW, "[2]") + _c(C.DIM, " clear BotB  ")
-            + _c(C.B + C.YLW, "[0]") + _c(C.DIM, " clear All")
+            + _c(C.B + C.YLW, "[1]") + _c(C.DIM, " BotA  ")
+            + _c(C.B + C.YLW, "[2]") + _c(C.DIM, " BotB  ")
+            + _c(C.B + C.YLW, "[3]") + _c(C.DIM, " BotC  ")
+            + _c(C.B + C.YLW, "[0]") + _c(C.DIM, " all  ")
+            + _c(C.B + C.CYN, "[c]") + _c(C.DIM, " screen  ")
+            + _c(C.B + C.CYN, "[e]") + _c(C.DIM, " errors")
             + _c(C.DIM, "  (local only — no trades sent)")
         )
 
@@ -705,6 +786,86 @@ class TradingTUI:
         return lines
 
 
+    def _spr_panel(self, market, risk) -> list[str]:
+        """Full-width panel for the Spread Bot (Bot C)."""
+        spr   = self.spr
+        pos   = spr.position
+        legs  = spr.legs
+        stats = spr.get_stats()
+
+        lines = [_c(C.B + C.YLW, "── BOT C · SPREAD ─────────────────────────────────────────────────────────────")]
+
+        if pos and pos.status == "spread":
+            cost   = pos.cost
+            locked = pos.guaranteed_profit
+            lines.append(
+                f"{'Status':<12} {_c(C.GRN, 'SPREAD LOCKED')}  "
+                f"UP {pos.up_entry:.3f} + DOWN {pos.down_entry:.3f}  "
+                f"cost ${cost:.2f}  "
+                f"locked {_pnl(locked)}"
+            )
+            lines.append(f"{'Outcome':<12} holds to expiry — one leg resolves at $1.00")
+            lines.append(f"{'Session':<12} {_pnl(spr._realized_pnl)}  "
+                         f"window {_pnl(spr._window_pnl)}  "
+                         f"spreads_done={stats['spreads_completed']}")
+
+        elif pos and pos.status in ("long_up", "long_down"):
+            side_s = "UP" if pos.status == "long_up" else "DOWN"
+            entry  = pos.up_entry if pos.status == "long_up" else pos.down_entry
+            size   = pos.up_size  if pos.status == "long_up" else pos.down_size
+            cur_px = market.up_price if pos.status == "long_up" else market.down_price
+            unreal = (cur_px - entry) * size
+            lines.append(
+                f"{'Status':<12} {_c(C.YLW, f'DIRECTIONAL {side_s}')}  "
+                f"entry {entry:.3f}  {size:.1f}sh  "
+                f"cur {cur_px:.3f}  unreal {_pnl(unreal)}"
+            )
+            lines.append(
+                f"{'SL':<12} {pos.sl_price:.3f}  "
+                f"({_pct((pos.sl_price - entry) / entry if entry else 0)} from entry)  "
+                f"({_elapsed(pos.entry_time)} held)"
+            )
+            lines.append(f"{'Session':<12} {_pnl(spr._realized_pnl)}  window {_pnl(spr._window_pnl)}")
+
+        elif legs:
+            age = time.time() - legs.posted_at
+            lines.append(
+                f"{'Status':<12} {_c(C.CYN, 'PENDING MAKER')}  "
+                f"UP @ {legs.up_bid:.3f}  DOWN @ {legs.down_bid:.3f}  "
+                f"{legs.size:.0f}sh/leg  posted {_elapsed(legs.posted_at)}"
+            )
+            combined = (legs.up_bid + legs.down_bid) * legs.size
+            locked   = legs.size * 1.0 - combined
+            lines.append(
+                f"{'Edge':<12} cost ${combined:.2f} → locked +${locked:.2f}  "
+                f"(if both fill at quoted prices)"
+            )
+            lines.append(f"{'Session':<12} {_pnl(spr._realized_pnl)}  window {_pnl(spr._window_pnl)}")
+
+        else:
+            lines.append(
+                f"{'Status':<12} {_c(C.DIM, 'WATCHING')}  "
+                f"attempted={spr._spread_attempted_this_window}  "
+                f"done={stats['spreads_completed']}  singles={stats['single_legs_today']}"
+            )
+            up_p   = market.up_price if market else 0.0
+            down_p = market.down_price if market else 0.0
+            in_band = (
+                spr.config.target_low <= up_p <= spr.config.target_high
+                and spr.config.target_low <= down_p <= spr.config.target_high
+            )
+            band_tag = _c(C.GRN, "IN BAND") if in_band else _c(C.DIM, f"need {spr.config.target_low:.2f}–{spr.config.target_high:.2f}")
+            tte      = market.time_to_expiry if market else 0
+            time_ok  = tte >= spr.config.min_time_remaining
+            time_tag = _c(C.GRN, f"{tte}s OK") if time_ok else _c(C.YLW, f"{tte}s (need {spr.config.min_time_remaining}s)")
+            lines.append(
+                f"{'Condition':<12} mid_UP={up_p:.3f}  mid_DN={down_p:.3f}  {band_tag}  time {time_tag}"
+            )
+            lines.append(f"{'Session':<12} {_pnl(spr._realized_pnl)}  window {_pnl(spr._window_pnl)}")
+
+        return lines
+
+
 # ── Helper: attach handler to bot loggers ─────────────────────────────────────
 
 def install_tui_handler(capture: TradingEventCapture) -> None:
@@ -713,7 +874,7 @@ def install_tui_handler(capture: TradingEventCapture) -> None:
     loggers and stop them propagating to the root handler while TUI
     is active (so trading noise doesn't scroll past the TUI).
     """
-    for name in ("bots.momentum_bot", "bots.mean_reversion_bot", "bots.coordinator"):
+    for name in ("bots.momentum_bot", "bots.mean_reversion_bot", "bots.coordinator", "bots.spread_bot"):
         lg = logging.getLogger(name)
         lg.addHandler(capture)
         lg.propagate = False  # TUI owns trading output
