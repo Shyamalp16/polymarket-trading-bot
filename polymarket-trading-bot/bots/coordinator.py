@@ -50,6 +50,7 @@ from enum import Enum
 from lib.shared_state import SharedState, MarketRegime
 from bots.mean_reversion_bot import ReversionSide
 from bots.spread_bot import SpreadBot
+from src.data_api_client import DataApiClient
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,10 @@ class CoordinatorConfig:
     # Late window
     late_window_threshold: float = 0.15  # <15% time remaining
 
+    # Session-level circuit breaker (cross-window)
+    session_loss_limit_pct: float = 0.15  # halt if session losses > 15% bankroll ($15 on $100)
+    max_drawdown_pct: float = 0.20        # halt if peak-to-trough drawdown > 20%
+
 
 @dataclass
 class WindowState:
@@ -147,12 +152,14 @@ class Coordinator:
         shared_state: SharedState,
         config: CoordinatorConfig = None,
         spread_bot: Optional[SpreadBot] = None,
+        data_api: Optional[DataApiClient] = None,
     ):
         self.momentum = momentum_bot
         self.mean_reversion = mean_reversion_bot
         self.spread = spread_bot   # Optional — None disables spread strategy
         self.state = shared_state
         self.config = config or CoordinatorConfig()
+        self._data_api = data_api  # Optional — whale confirmation for snipes
 
         # Capital available per bot
         self._momentum_capital = self.config.total_bankroll * self.config.momentum_allocation
@@ -171,6 +178,12 @@ class Coordinator:
 
         # Window reset tracking via token_id (P2-11)
         self._last_token_id_up: str = ""
+
+        # Session-level circuit breaker state (persists across windows)
+        self._session_losses: float = 0.0
+        self._session_gains: float = 0.0
+        self._peak_bankroll: float = self.config.total_bankroll
+        self._circuit_halted: bool = False
 
         # Running state
         self._running = False
@@ -191,7 +204,18 @@ class Coordinator:
         """Stop coordinator."""
         self._running = False
         logger.info("Coordinator stopped")
-    
+
+    def _check_circuit_breaker(self) -> Optional[str]:
+        """Return a halt reason string if a session-level risk limit is breached, else None."""
+        limit = self.config.session_loss_limit_pct * self.config.total_bankroll
+        if self._session_losses > limit:
+            return f"session loss limit (${self._session_losses:.2f} > ${limit:.2f})"
+        current = self.config.total_bankroll + self._session_gains - self._session_losses
+        drawdown = (self._peak_bankroll - current) / max(self._peak_bankroll, 0.01)
+        if drawdown > self.config.max_drawdown_pct:
+            return f"max drawdown ({drawdown:.1%})"
+        return None
+
     async def check_and_coordinate(self) -> Optional[Dict[str, Any]]:
         """
         Main coordination loop - check both bots for signals and resolve conflicts.
@@ -201,6 +225,15 @@ class Coordinator:
         """
         if not self._running:
             return None
+
+        # Session-level circuit breaker — halt ALL new entries if a risk limit is breached
+        cb_reason = self._check_circuit_breaker()
+        if cb_reason:
+            if not self._circuit_halted:
+                self._circuit_halted = True
+                logger.warning("==> CIRCUIT BREAKER: trading halted — %s", cb_reason)
+            return None
+        self._circuit_halted = False  # reset once we're within limits again
         
         # Check window reset
         await self._check_window_reset()
@@ -209,44 +242,62 @@ class Coordinator:
         market = self.state.get_market_data()
         risk = self.state.get_risk_metrics()
         
-        # Check toxicity guards first
-        if risk.vpin > self.config.vpin_block_mr:
-            # Block mean reversion entirely
-            logger.debug("Coordinator: blocking MR due to high VPIN %.2f", risk.vpin)
-        
-        if risk.fragility > self.config.fragility_block_momentum:
-            # Block momentum chases after failures
-            logger.debug("Coordinator: high fragility %.2f", risk.fragility)
-        
-        # Get signals from both bots
+        # ── Toxicity guards ────────────────────────────────────────────────────
+        # These gates suppress signal *computation* for the blocked bot so we
+        # don't waste CPU on z-scores/OB-confidence we'll throw away anyway.
+        vpin_blocks_mr       = risk.vpin      > self.config.vpin_block_mr
+        fragility_blocks_mom = risk.fragility > self.config.fragility_block_momentum
+
+        if vpin_blocks_mr:
+            logger.info("Coordinator: MR blocked — high VPIN %.2f", risk.vpin)
+        if fragility_blocks_mom:
+            logger.info("Coordinator: Momentum blocked — high fragility %.2f", risk.fragility)
+
+        # Get signals from both bots (skip computation when toxicity gate fires)
         momentum_signal = None
         mr_signal = None
-        
-        # Check momentum
-        momentum_signal = await self.momentum.check_entry()
-        
+
+        # Check momentum (skip if fragility gate is active)
+        if not fragility_blocks_mom:
+            momentum_signal = await self.momentum.check_entry()
+
         # Block momentum if already had position this window
         if momentum_signal and self._window and self._window.momentum_had_position:
             logger.info("Coordinator: blocking momentum re-entry (already had position this window)")
             momentum_signal = None
-        
+
         if momentum_signal:
             logger.info(f"==> MOMENTUM SIGNAL: {momentum_signal.side.value.upper()} | conf={momentum_signal.confidence:.0%} | {momentum_signal.reason}")
-        
+
         # Check if we're in impulse priority window
         in_impulse_window = await self._is_in_impulse_window()
-        
-        # Check mean reversion
-        mr_signal = await self.mean_reversion.check_entry()
-        
+
+        # Check mean reversion (skip if VPIN gate is active)
+        if not vpin_blocks_mr:
+            mr_signal = await self.mean_reversion.check_entry()
+
         # Block MR if already had position this window
         if mr_signal and self._window and self._window.mr_had_position:
             logger.info("Coordinator: blocking MR re-entry (already had position this window)")
             mr_signal = None
         
+        # Only surface the MR signal in the TUI when MR is actually free to act.
+        # If SPR has a filled position or MR already had a position this window,
+        # the signal will be blocked anyway — logging it every 250 ms is noise.
         if mr_signal:
-            logger.info(f"==> MR SIGNAL: {mr_signal.side.value.upper()} | conf={mr_signal.confidence:.0%} | {mr_signal.reason}")
-        
+            spr_locked = self.spread and self.spread.position is not None
+            mr_blocked = spr_locked or (self._window and self._window.mr_had_position)
+            if mr_blocked:
+                logger.debug(
+                    "MR signal suppressed (blocked): %s conf=%d%%",
+                    mr_signal.side.value.upper(), int(mr_signal.confidence * 100),
+                )
+            else:
+                logger.info(
+                    "==> MR SIGNAL: %s | conf=%d%% | %s",
+                    mr_signal.side.value.upper(), int(mr_signal.confidence * 100), mr_signal.reason,
+                )
+
         # ── SpreadBot: tick fill-monitor and exit-monitor every loop ─────────
         # These run regardless of late-window state so fills and SL exits
         # are always processed.  check_spread() handles its own time gate.
@@ -271,7 +322,9 @@ class Coordinator:
             return None
 
         # ── SpreadBot: attempt to post a new spread this window ──────────────
-        if self.spread and not self._window.spread_attempted:
+        # Don't enter a spread if MR already used capital this window — only one
+        # directional + SPR stack per window to avoid double capital deployment.
+        if self.spread and not self._window.spread_attempted and not self._window.mr_had_position:
             spread_result = await self.spread.check_spread()
             if spread_result and spread_result.get("success"):
                 if self._window:
@@ -369,26 +422,47 @@ class Coordinator:
         if self.mean_reversion._pending_maker_order:
             return None
 
-        up_p   = market.up_price
-        down_p = market.down_price
+        # Use the ask price for entry evaluation, not the mid.
+        # The FOK will be filled at the ask; if the ask is already ≥ 0.96 the
+        # margin is too thin even though the mid might be below the ceiling.
+        up_ask   = market.up_asks[0][0]   if market.up_asks   else market.up_price
+        down_ask = market.down_asks[0][0] if market.down_asks else market.down_price
 
-        if 0.85 <= up_p < 0.96:
+        if 0.85 <= up_ask < 0.96:
             side      = ReversionSide.UP
             token_id  = market.token_id_up
-            price     = up_p
-        elif 0.85 <= down_p < 0.96:
+            price     = up_ask
+        elif 0.85 <= down_ask < 0.96:
             side      = ReversionSide.DOWN
             token_id  = market.token_id_down
-            price     = down_p
+            price     = down_ask
         else:
             return None
 
         if not token_id:
             return None
 
-        # Snipe size: 7 shares — slightly larger than normal entries to make the
-        # near-certain resolution payout worth the FOK spread cost.
-        size = 10.5
+        # Whale confirmation: require non-trivial open interest before sniping.
+        # Thin OI (< 50 shares) suggests nobody believes in this resolution —
+        # skip the snipe. Falls back to allow on network error.
+        if self._data_api is not None:
+            try:
+                oi = await asyncio.to_thread(
+                    self._data_api.get_token_open_interest, token_id
+                )
+                if oi < 50.0:
+                    logger.debug(
+                        "Snipe skipped — open interest %.1f too low for %s",
+                        oi, token_id,
+                    )
+                    return None
+                logger.debug("Snipe OI check passed — %.1f shares held", oi)
+            except Exception as exc:
+                logger.debug("Snipe OI check failed (network?), allowing snipe: %s", exc)
+
+        # Snipe size — near-certain $1.00 resolution justifies a larger position.
+        # At 87¢ entry: 20sh × $0.13 gain = $2.60 (2.6% of $100 bankroll).
+        size = 20.0
 
         logger.info(
             "==> EXPIRY SNIPE: %s @ %.3f | %ds remaining | expect $1.00 resolution",
@@ -474,10 +548,15 @@ class Coordinator:
     async def _approve_momentum(self, signal, risk) -> Optional[Dict[str, Any]]:
         """Approve momentum entry with checks."""
 
-        # Block regular entries while spread bot has active legs or a filled position.
+        # Block regular entries only when spread has a FILLED position — meaning
+        # capital is already deployed in the market and adding another directional
+        # bet would concentrate risk.  Pending GTC legs that haven't filled yet
+        # (e.g. bids resting far from the current price) do NOT block entries —
+        # blocking on pending-only caused MR to sit idle for the entire window
+        # when SPR posted at 50¢ and the market moved heavily one way.
         # Snipes bypass this method entirely so they are unaffected.
-        if self.spread and self.spread.has_position:
-            logger.debug("Momentum: blocked — SPR trade active")
+        if self.spread and self.spread.position is not None:
+            logger.debug("Momentum: blocked — SPR filled position active")
             return None
 
         # Already in a position
@@ -556,10 +635,12 @@ class Coordinator:
     async def _approve_mean_reversion(self, signal, risk, in_impulse_window: bool) -> Optional[Dict[str, Any]]:
         """Approve mean reversion entry with checks."""
 
-        # Block regular entries while spread bot has active legs or a filled position.
+        # Block regular entries only when spread has a FILLED position — meaning
+        # capital is already deployed.  Pending GTC legs that haven't filled yet
+        # do NOT block entries.  See _approve_momentum for full rationale.
         # Snipes bypass this method entirely so they are unaffected.
-        if self.spread and self.spread.has_position:
-            logger.debug("MR: blocked — SPR trade active")
+        if self.spread and self.spread.position is not None:
+            logger.debug("MR: blocked — SPR filled position active")
             return None
 
         # Already in a position OR a maker order is resting (pending fill).
@@ -693,6 +774,14 @@ class Coordinator:
                 pnl = result.get("pnl", 0)
                 if self._window and pnl < 0:
                     self._window.losses += abs(pnl)
+                # Accumulate session-level P&L for circuit breaker
+                if pnl < 0:
+                    self._session_losses += abs(pnl)
+                else:
+                    self._session_gains += pnl
+                current_bankroll = self.config.total_bankroll + self._session_gains - self._session_losses
+                if current_bankroll > self._peak_bankroll:
+                    self._peak_bankroll = current_bankroll
                 logger.info(f"Exit: {bot_type.value} {reason} PnL: ${pnl:.2f}")
 
             elif had_position_before and not bot.has_position:
@@ -706,6 +795,7 @@ class Coordinator:
                     mercy_pct = 0.30  # conservative floor
                     estimated_loss = entry_price * size * mercy_pct
                     self._window.losses += estimated_loss
+                    self._session_losses += estimated_loss
                     logger.warning(
                         f"Exit: {bot_type.value} {reason} FORCE-CLEARED — estimated loss ${estimated_loss:.2f}"
                     )

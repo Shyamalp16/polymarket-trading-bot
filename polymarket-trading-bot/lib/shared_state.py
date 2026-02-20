@@ -201,6 +201,11 @@ class SharedState:
                 'down_price': down_price,
             })
     
+    async def update_expiry(self, time_to_expiry: int) -> None:
+        """Update only the time_to_expiry field without touching orderbook data."""
+        async with self._lock:
+            self._market.time_to_expiry = time_to_expiry
+
     def _calculate_depth(self, side_a: list, side_b: list, decay: float = 0.7) -> float:
         """Calculate depth-weighted orderbook depth combining both token sides."""
         depth = 0.0

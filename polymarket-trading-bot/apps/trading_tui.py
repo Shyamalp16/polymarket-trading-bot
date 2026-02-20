@@ -162,6 +162,20 @@ _PATS: list[tuple] = [
     # MR escalating to taker
     (re.compile(r"MR: escalating to taker"), "MR", "ESCALATE"),
 
+    # ==> MR ENTRY FAILED: FOK rejected (attempt 1/3) — INVALID_ORDER...
+    (re.compile(r"==> MR ENTRY FAILED: (.+)"), "MR", "ERROR"),
+
+    # ==> MR MAKER REJECTED: post_only crossed spread — ...
+    (re.compile(r"==> MR MAKER REJECTED: (.+)"), "MR", "ERROR"),
+
+    # ==> MOM ENTRY FAILED: FAK rejected (attempt 1/2) — ...
+    (re.compile(r"==> MOM ENTRY FAILED: (.+)"), "MOM", "ERROR"),
+
+    # Order rejected by CLOB: BUY 5.00@0.0950 type=FOK — INVALID_ORDER_...
+    (re.compile(
+        r"Order rejected by CLOB: (\w+) ([\d.]+)@([\d.]+) type=(\w+) — (.+)"
+     ), "BOT", "ERROR"),
+
     # ==> MR CLOSE FAILED: SL | attempt 2 | reason: no token_id ...
     (re.compile(
         r"==> MR CLOSE FAILED: (\w+) \| attempt (\d+) \| reason: (.+)"
@@ -183,9 +197,15 @@ _PATS: list[tuple] = [
      ), "SPR", "ENTRY"),
 
     # ==> SPREAD FILLED: UP @ 0.480  DOWN @ 0.480 | cost $4.80 | locked +$0.20
+    # Both legs filled = spread locked, NOT an exit.  Use "LOCKED" etype.
     (re.compile(
         r"==> SPREAD FILLED: UP @ ([\d.]+)\s+DOWN @ ([\d.]+) \| cost \$([\d.]+) \| locked \+\$([\d.]+)"
-     ), "SPR", "EXIT"),
+     ), "SPR", "LOCKED"),
+
+    # ==> SPREAD RELEASED: UP 0.480 + DOWN 0.480 | locked +$0.20 | resolves on-chain…
+    (re.compile(
+        r"==> SPREAD RELEASED: UP ([\d.]+) \+ DOWN ([\d.]+) \| locked \+\$([\d.]+)"
+     ), "SPR", "LOCKED"),
 
     # ==> SPREAD SINGLE LEG: UP @ 0.480 | 5 sh | SL 0.408
     (re.compile(
@@ -215,6 +235,23 @@ _PATS: list[tuple] = [
     (re.compile(
         r"==> MOMENTUM CLOSE FAILED: (\w+) \| (FORCE CLEAR.+)"
      ), "MOM", "ERROR"),
+
+    # src.client HTTP error: HTTP 400 POST /order: {"errorMsg":"...",...}
+    # Also matches 401, 403, 422, 500, etc.
+    (re.compile(r"HTTP (\d+) (\w+) ([^ :]+): (.+)"), "BOT", "ERROR"),
+
+    # ==> CIRCUIT BREAKER: trading halted — session loss limit ($15.00 > $15.00)
+    (re.compile(r"==> CIRCUIT BREAKER: trading halted — (.+)"), "SYS", "HALT"),
+
+    # ==> SPREAD SELL: UP ask=0.540 + DN ask=0.540 = 1.080 > threshold 1.040 | locked=$0.40
+    (re.compile(
+        r"==> SPREAD SELL: UP ask=([\d.]+) \+ DN ask=([\d.]+) = ([\d.]+) > threshold ([\d.]+) \| locked=\$([\d.]+)"
+     ), "SPR", "SIGNAL"),
+
+    # ==> SPREAD SELL POSTED: UP order_id=0x... | DOWN order_id=0x... | locked=$0.40
+    (re.compile(
+        r"==> SPREAD SELL POSTED: UP order_id=\S+ \| DOWN order_id=\S+ \| locked=\$([\d.]+)"
+     ), "SPR", "LOCKED"),
 ]
 
 
@@ -252,8 +289,8 @@ class TradingEventCapture(logging.Handler):
                 # New window → clear the per-window log and reset window PnL
                 self.events.clear()
                 self.window_pnl = 0.0
-            # Errors go into a separate sticky list that never clears
-            if ev.etype == "ERROR":
+            # Errors and HALT events go into a separate sticky list that never clears
+            if ev.etype in ("ERROR", "HALT"):
                 self.errors.insert(0, ev)
                 if len(self.errors) > 20:   # cap at 20 to avoid unbounded growth
                     self.errors.pop()
@@ -317,6 +354,11 @@ class TradingEventCapture(logging.Handler):
                     s_side, s_price, s_shares, s_sl = g
                     detail = f"{s_side:<4} single @ {s_price}  {s_shares}sh  SL={s_sl}"
                     return TEvent(etype="SIGNAL", bot=bot, side=s_side, detail=detail)
+                elif len(g) == 5 and bot == "SPR":
+                    # SPREAD SELL detected: (up_ask, dn_ask, sum, threshold, locked)
+                    up_a, dn_a, _sum, _thr, locked = g
+                    detail = f"SELL UP@{up_a} + DN@{dn_a}  locked +${locked}"
+                    return TEvent(etype="SIGNAL", bot="SPR", side="--", detail=detail)
                 else:
                     detail = "  ".join(str(x) for x in g)
                     return TEvent(etype="SIGNAL", bot=bot, side="--", detail=detail)
@@ -335,6 +377,40 @@ class TradingEventCapture(logging.Handler):
             if etype == "ESCALATE":
                 return TEvent(etype="ESCALATE", bot="MR", side="--", detail="maker → taker")
 
+            if etype == "LOCKED":
+                if len(g) == 4:
+                    # SPREAD FILLED: (up_bid, down_bid, cost, locked)
+                    up_b, dn_b, cost, locked = g
+                    detail = f"UP {up_b} + DN {dn_b}  cost ${cost}  locked +${locked}"
+                    try:
+                        pnl = float(locked)
+                    except ValueError:
+                        pnl = None
+                    return TEvent(etype="LOCKED", bot="SPR", side="--", detail=detail, pnl=pnl)
+                elif len(g) == 3:
+                    # SPREAD RELEASED: (up_entry, down_entry, locked)
+                    up_e, dn_e, locked = g
+                    detail = f"released UP {up_e} + DN {dn_e}  locked +${locked} → on-chain"
+                    return TEvent(etype="LOCKED", bot="SPR", side="--", detail=detail)
+                elif len(g) == 1:
+                    # SPREAD SELL POSTED: (locked)
+                    locked = g[0]
+                    try:
+                        pnl = float(locked)
+                    except ValueError:
+                        pnl = None
+                    detail = f"SELL both legs posted  locked +${locked}"
+                    return TEvent(etype="LOCKED", bot="SPR", side="--", detail=detail, pnl=pnl)
+                else:
+                    return TEvent(etype="LOCKED", bot="SPR", side="--",
+                                  detail="  ".join(str(x) for x in g))
+
+            if etype == "HALT":
+                # CIRCUIT BREAKER triggered — sticky error-level event
+                reason = g[0] if g else "unknown"
+                return TEvent(etype="HALT", bot="SYS", side="--",
+                              detail=f"TRADING HALTED — {reason.strip()}")
+
             if etype == "RATCHET":
                 if len(g) == 3 and g[0]:
                     # Trailing SL ratchet: groups = (old_sl, new_sl, "[TRAIL]"?)
@@ -345,12 +421,22 @@ class TradingEventCapture(logging.Handler):
                 return TEvent(etype="RATCHET", bot=bot, side="--", detail=label)
 
             if etype == "ERROR":
-                if len(g) == 3:
+                if len(g) == 5:
+                    # CLOB rejection: (side, size, price, order_type, reason)
+                    e_side, e_size, e_price, e_type, e_reason = g
+                    detail = f"{e_side} {e_size}@{e_price} [{e_type}] {e_reason.strip()}"
+                elif len(g) == 4:
+                    # HTTP error from src.client: (status, method, endpoint, body)
+                    h_status, h_method, h_ep, h_body = g
+                    detail = f"HTTP {h_status} {h_method} {h_ep}: {h_body.strip()}"
+                elif len(g) == 3:
                     trigger, attempt, reason = g
                     detail = f"{trigger} attempt {attempt}: {reason.strip()}"
                 elif len(g) == 2:
                     trigger, detail_raw = g
                     detail = f"{trigger} {detail_raw.strip()}"
+                elif len(g) == 1:
+                    detail = str(g[0]).strip()
                 else:
                     detail = " ".join(str(x) for x in g)
                 return TEvent(etype="ERROR", bot=bot, side="--", detail=detail)
@@ -367,12 +453,14 @@ _ICONS = {
     "SIGNAL":   ("◈", C.CYN),
     "ENTRY":    ("▶", C.GRN),
     "EXIT":     ("✓", C.YLW),
+    "LOCKED":   ("◉", C.GRN),   # spread both-legs-filled / released
     "MARKET":   ("⟳", C.MAG),
     "SYSTEM":   ("ℹ", C.BLU),
     "MAKER":    ("◷", C.CYN),
     "ESCALATE": ("↑", C.YLW),
     "RATCHET":  ("↗", C.GRN),
     "ERROR":    ("✖", C.RED),
+    "HALT":     ("⛔", C.RED),  # session circuit breaker triggered
 }
 
 
@@ -396,8 +484,8 @@ class TradingTUI:
         capture: TradingEventCapture,
         shared_state: "SharedState",
         coordinator: "Coordinator",
-        momentum_bot: "MomentumBot",
-        mr_bot: "MeanReversionBot",
+        momentum_bot: Optional["MomentumBot"] = None,
+        mr_bot: Optional["MeanReversionBot"] = None,
         spread_bot: Optional["SpreadBot"] = None,
         btc_tracker: Optional["BTCPriceTracker"] = None,
         refresh_interval: float = 0.5,
@@ -509,17 +597,17 @@ class TradingTUI:
         cleared: list[str] = []
 
         if which == "A":
-            if self.mom._position is not None:
+            if self.mom is not None and self.mom._position is not None:
                 side = self.mom._position.side.value.upper()
                 self.mom._position = None
                 cleared.append(f"BotA pos ({side})")
 
         elif which == "B":
-            if self.mr._position is not None:
+            if self.mr is not None and self.mr._position is not None:
                 side = self.mr._position.side.value.upper()
                 self.mr._position = None
                 cleared.append(f"BotB pos ({side})")
-            if self.mr._pending_maker_order is not None:
+            if self.mr is not None and self.mr._pending_maker_order is not None:
                 self.mr._pending_maker_order = None
                 cleared.append("BotB maker order")
 
@@ -597,14 +685,13 @@ class TradingTUI:
         # ── Bot panels (side-by-side) ─────────────────────────────────────────
         mom_lines = self._mom_panel(market, risk, regime)
         mr_lines  = self._mr_panel(market, risk, regime)
-        h = max(len(mom_lines), len(mr_lines))
-        mom_lines += [""] * (h - len(mom_lines))
-        mr_lines  += [""] * (h - len(mr_lines))
-
-        for ml, rl in zip(mom_lines, mr_lines):
-            lines.append(" " + _pad(ml, _HALF) + "  " + rl)
-
-        lines.append(_ruler())
+        if mom_lines or mr_lines:
+            h = max(len(mom_lines), len(mr_lines))
+            mom_lines += [""] * (h - len(mom_lines))
+            mr_lines  += [""] * (h - len(mr_lines))
+            for ml, rl in zip(mom_lines, mr_lines):
+                lines.append(" " + _pad(ml, _HALF) + "  " + rl)
+            lines.append(_ruler())
 
         # ── Spread panel (full width) ─────────────────────────────────────────
         if self.spr is not None:
@@ -621,12 +708,16 @@ class TradingTUI:
         # PnL read directly from bot objects (reliable — not log-parsed)
         spr_rpnl    = self.spr._realized_pnl if self.spr else 0.0
         spr_wpnl    = self.spr._window_pnl   if self.spr else 0.0
-        session_pnl = self.mom._realized_pnl + self.mr._realized_pnl + spr_rpnl
-        window_pnl  = self.mom._window_pnl   + self.mr._window_pnl   + spr_wpnl
+        mom_rpnl    = self.mom._realized_pnl if self.mom else 0.0
+        mom_wpnl    = self.mom._window_pnl   if self.mom else 0.0
+        mr_rpnl     = self.mr._realized_pnl  if self.mr  else 0.0
+        mr_wpnl     = self.mr._window_pnl    if self.mr  else 0.0
+        session_pnl = mom_rpnl + mr_rpnl + spr_rpnl
+        window_pnl  = mom_wpnl + mr_wpnl  + spr_wpnl
 
         # Unrealized: only open positions contribute
-        mom_pos = self.mom.position
-        mr_pos  = self.mr.position
+        mom_pos = self.mom.position if self.mom else None
+        mr_pos  = self.mr.position  if self.mr  else None
         spr_pos = self.spr.position if self.spr else None
         unreal = 0.0
         if mom_pos:
@@ -651,7 +742,7 @@ class TradingTUI:
             f" {_c(C.RED,'DN')}  mid {market.down_price:.3f}"
             f"  bid {dn_bid:.3f} / ask {dn_ask:.3f}"
             f"    │  Window  {_pnl(window_pnl)}"
-            f"  mom {_pnl(self.mom._window_pnl)}  mr {_pnl(self.mr._window_pnl)}"
+            + (f"  mom {_pnl(mom_wpnl)}  mr {_pnl(mr_wpnl)}" if (self.mom or self.mr) else "")
             + (f"  spr {_pnl(spr_wpnl)}" if self.spr else "")
         )
         lines.append(_ruler())
@@ -659,18 +750,31 @@ class TradingTUI:
         # ── Sticky error panel — persists across market resets ────────────────────
         if self.capture.errors:
             lines.append(
-                _c(C.B + C.RED, " ✖ CLOSE FAILURES")
+                _c(C.B + C.RED, " ✖ ORDER FAILURES")
                 + _c(C.DIM, "  (persist across markets — most recent first)")
             )
-            max_d = _W - 36
-            for ev in self.capture.errors[:5]:   # show latest 5
-                ts_s   = datetime.fromtimestamp(ev.ts).strftime("%H:%M:%S")
+            # Each error wraps across up to 3 lines so the full JSON body is visible.
+            line_w   = _W - 14   # usable chars per continuation line
+            prefix_w = 14        # "  HH:MM:SS  ✖ BOT " header
+            for ev in self.capture.errors[:5]:
+                ts_s    = datetime.fromtimestamp(ev.ts).strftime("%H:%M:%S")
                 bot_col = C.CYN if ev.bot == "MOM" else (C.MAG if ev.bot == "MR" else C.YLW)
                 bot_str = _c(bot_col, f"{ev.bot:<3}")
-                detail  = ev.detail
-                if len(_vis(detail)) > max_d:
-                    detail = detail[:max_d] + "…"
-                lines.append(f"  {_c(C.DIM, ts_s)}  {_c(C.RED, '✖')} {bot_str} {_c(C.RED, detail)}")
+                raw     = ev.detail
+                # Split into chunks of line_w visible chars
+                chunks: list[str] = []
+                while _vis(raw):
+                    chunks.append(raw[:line_w])
+                    raw = raw[line_w:]
+                    if len(chunks) >= 3:
+                        if raw:
+                            chunks[-1] = chunks[-1][:-1] + "…"
+                        break
+                header = f"  {_c(C.DIM, ts_s)}  {_c(C.RED, '✖')} {bot_str} {_c(C.RED, chunks[0])}"
+                lines.append(header)
+                indent = " " * prefix_w
+                for chunk in chunks[1:]:
+                    lines.append(f"{indent}{_c(C.RED, chunk)}")
             lines.append(_ruler())
 
         # ── Event log — all events for this window ────────────────────────────────
@@ -685,7 +789,8 @@ class TradingTUI:
             lines.append(_c(C.DIM, "   no events yet — waiting for signals…"))
         else:
             # Show ALL events for this window (newest first); terminal scrolls naturally.
-            max_d = _W - 34
+            max_d    = _W - 34
+            max_err  = _W * 4    # ERROR details can be long JSON — allow up to 4× width
             for ev in self.capture.events:
                 ts_s    = datetime.fromtimestamp(ev.ts).strftime("%H:%M:%S")
                 icon_ch, icon_col = _ICONS.get(ev.etype, ("·", C.DIM))
@@ -695,8 +800,9 @@ class TradingTUI:
                 etype_s = _c(_ICONS.get(ev.etype, ("·", C.DIM))[1], f"{ev.etype:<8}")
                 pnl_tag = f"  {_pnl(ev.pnl)}" if ev.pnl is not None else ""
                 detail  = ev.detail
-                if len(_vis(detail)) > max_d:
-                    detail = detail[:max_d] + "…"
+                limit   = max_err if ev.etype == "ERROR" else max_d
+                if len(_vis(detail)) > limit:
+                    detail = detail[:limit] + "…"
                 lines.append(
                     f"  {_c(C.DIM, ts_s)}  {icon} {bot_str} {etype_s} {detail}{pnl_tag}"
                 )
@@ -729,6 +835,8 @@ class TradingTUI:
     # ── Bot panel builders ────────────────────────────────────────────────────
 
     def _mom_panel(self, market, risk, regime: str) -> list[str]:
+        if self.mom is None:
+            return []
         pos    = self.mom.position
         stats  = self.mom.get_stats()
         spot2  = risk.btc_spot_change_2s
@@ -770,6 +878,8 @@ class TradingTUI:
         return lines
 
     def _mr_panel(self, market, risk, regime: str) -> list[str]:
+        if self.mr is None:
+            return []
         pos     = self.mr.position
         stats   = self.mr.get_stats()
         pending = self.mr._pending_maker_order
@@ -891,8 +1001,22 @@ class TradingTUI:
             tte      = market.time_to_expiry if market else 0
             time_ok  = tte >= spr.config.min_time_remaining
             time_tag = _c(C.GRN, f"{tte}s OK") if time_ok else _c(C.YLW, f"{tte}s (need {spr.config.min_time_remaining}s)")
+
+            # Potential locked profit: compute the same way check_spread does
+            _up_ask  = market.up_asks[0][0]   if market.up_asks   else up_p
+            _dn_ask  = market.down_asks[0][0] if market.down_asks else down_p
+            _up_bid  = round(max(0.01, _up_ask  - spr.config.bid_offset), 4)
+            _dn_bid  = round(max(0.01, _dn_ask  - spr.config.bid_offset), 4)
+            _pot     = (1.0 - (_up_bid + _dn_bid)) * spr.config.size_per_leg
+            if _pot >= spr.config.min_locked_profit:
+                _pot_tag = _c(C.GRN,  f"pot +${_pot:.2f}")
+            elif _pot > 0:
+                _pot_tag = _c(C.YLW,  f"pot +${_pot:.2f} (< min ${spr.config.min_locked_profit:.2f})")
+            else:
+                _pot_tag = _c(C.DIM,  f"pot ${_pot:.2f}")
+
             lines.append(
-                f"{'Condition':<12} mid_UP={up_p:.3f}  mid_DN={down_p:.3f}  {band_tag}  time {time_tag}"
+                f"{'Condition':<12} mid_UP={up_p:.3f}  mid_DN={down_p:.3f}  {band_tag}  {_pot_tag}  time {time_tag}"
             )
             lines.append(f"{'Session':<12} {_pnl(spr._realized_pnl)}  window {_pnl(spr._window_pnl)}")
 
@@ -906,9 +1030,25 @@ def install_tui_handler(capture: TradingEventCapture) -> None:
     Attach the event-capture handler to the relevant bot/coordinator
     loggers and stop them propagating to the root handler while TUI
     is active (so trading noise doesn't scroll past the TUI).
+
+    src.client keeps propagation ON so HTTP errors still reach the root
+    file handler (logs/errors.log) even when TUI is running.
     """
-    for name in ("bots.momentum_bot", "bots.mean_reversion_bot", "bots.coordinator", "bots.spread_bot"):
+    # Bot loggers: attach capture and silence console (TUI owns output)
+    for name in (
+        "bots.momentum_bot",
+        "bots.mean_reversion_bot",
+        "bots.coordinator",
+        "bots.spread_bot",
+        "src.bot",    # captures "Order rejected by CLOB: ..." warnings
+    ):
         lg = logging.getLogger(name)
         lg.addHandler(capture)
         lg.propagate = False  # TUI owns trading output
+
+    # src.client: attach capture but keep propagation so file handler still gets it
+    _cl = logging.getLogger("src.client")
+    _cl.addHandler(capture)
+    # propagate stays True → errors also flow to logs/errors.log via root handler
+
     capture.setLevel(logging.DEBUG)

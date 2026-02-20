@@ -266,7 +266,14 @@ class MomentumBot:
         impulse_strength = min(1.0, abs(spot_change) / threshold)
         vpin_factor = max(0.1, 1 - risk.vpin)
 
-        confidence = impulse_strength * vpin_factor
+        # Orderbook imbalance component (30% weight).
+        # market.imbalance: 0 = bid-heavy (bullish UP), 1 = ask-heavy (bearish UP).
+        # For an UP signal we want bid-heavy (imbalance → 0, ob_confirm → 1).
+        # For a DOWN signal we want ask-heavy (imbalance → 1, ob_confirm → 1).
+        ob_confirm = (1.0 - market.imbalance) if side == MomentumSide.UP else market.imbalance
+        ob_factor = max(0.3, ob_confirm)  # floor 0.3 — OB alone can't kill a valid impulse
+
+        confidence = (impulse_strength * vpin_factor) * 0.70 + ob_factor * 0.30
         
         if confidence < self.config.min_signal_strength:
             logger.debug("Momentum: confidence %.2f below min %.2f", confidence, self.config.min_signal_strength)
@@ -286,22 +293,29 @@ class MomentumBot:
         return signal
     
     def calculate_size(self, signal: MomentumSignal) -> float:
-        """
-        Calculate position size in shares (min $1 value, max 10 shares).
+        """Calculate position size using half-Kelly criterion.
+
+        Scales shares between the 5-share floor and a 30-share cap based on
+        signal confidence and the trade's win/loss odds.  Uses TP1/SL ratio
+        as the edge multiplier so strong impulses get proportionally larger size.
         """
         market = self.state.get_market_data()
-        mid_price = market.mid_price
+        mid_price = market.mid_price or 0.5
         if mid_price <= 0:
-            return 0
-        
-        # Calculate shares needed for minimum $1 order value
-        min_value_shares = 1.0 / mid_price  # e.g., 1/0.10 = 10 shares
-        
-        # Minimum 5 shares, or more if needed to hit $1 minimum
-        # Cap at 10 shares max
-        size_shares = max(5.0, min(min_value_shares, 10.0))
-        
-        return round(size_shares, 2)
+            return 5.0
+
+        # Kelly fraction: f = (b*p - q) / b, halved for safety
+        b = self.config.tp1_pct / max(self.config.initial_sl_pct, 0.01)
+        p = max(0.0, min(1.0, signal.confidence))
+        q = 1.0 - p
+        raw_kelly = (b * p - q) / b
+        kelly_frac = max(0.0, raw_kelly) * 0.5   # half-Kelly
+
+        capital = self.config.bankroll * self.config.max_position_pct
+        dollar_size = capital * kelly_frac
+        shares = dollar_size / mid_price
+
+        return round(max(5.0, min(shares, 30.0)), 2)
     
     async def execute(self, signal: MomentumSignal, size_override: Optional[float] = None) -> Dict[str, Any]:
         """Execute momentum entry.
@@ -344,39 +358,70 @@ class MomentumBot:
 
         if signal.side == MomentumSide.UP:
             token_id = market.token_id_up
-            side = "BUY"
         else:
             token_id = market.token_id_down
-            side = "BUY"  # Must BUY to open a DOWN position
+        side = "BUY"  # always BUY the token matching the direction
 
-        # Execute FOK order with retries (for first-time setup issues)
-        max_retries = 5
+        # FAK with a +0.03 price sweep: fills whatever depth is available across
+        # multiple ask levels and kills the rest.  Unlike FOK this never fully fails
+        # on thin books — a partial fill is still a valid position.
+        # 2 retries is enough; the sweep already covers several ticks.
+        max_retries = 2
         for attempt in range(max_retries):
-            # Refresh market data on each retry — prices may have changed
+            # Refresh market data on each retry so the price is current
             market = self.state.get_market_data()
-            price = market.up_price if signal.side == MomentumSide.UP else market.down_price
+
+            # Always use best ask — FAK/FOK must be marketable (price >= ask)
+            if signal.side == MomentumSide.UP:
+                raw_ask = market.up_asks[0][0] if market.up_asks else market.up_price
+            else:
+                raw_ask = market.down_asks[0][0] if market.down_asks else market.down_price
+
+            # Sweep 3 ticks above best ask to capture multiple depth levels
+            exec_price = round(min(raw_ask + 0.03, 0.99), 4)
 
             try:
                 result = await self.bot.place_order(
                     token_id=token_id,
-                    price=price,
+                    price=exec_price,
                     size=size,
                     side=side,
-                    order_type="FOK",
+                    order_type="FAK",
                 )
 
                 if result.success:
-                    actual_entry = round(price, 4)
+                    # FAK may report size_matched=0 even on partial fill — query settled order
+                    actual_filled = size
+                    if result.order_id:
+                        try:
+                            order_data = await self.bot.get_order(result.order_id)
+                            raw = (
+                                (order_data or {}).get("size_matched")
+                                or (order_data or {}).get("sizeMatched")
+                                or 0
+                            )
+                            queried = float(raw)
+                            if queried > 0:
+                                actual_filled = queried
+                        except Exception:
+                            pass  # keep actual_filled = size on query failure
 
+                    if actual_filled < 5.0:
+                        logger.warning(
+                            "==> MOM ENTRY FAILED: FAK partial fill too small (%.2f sh < 5.0 min)",
+                            actual_filled,
+                        )
+                        return {"success": False, "reason": f"partial fill too small: {actual_filled}"}
+
+                    actual_entry = exec_price
                     tp1_actual = actual_entry * (1 + self.config.tp1_pct)
                     tp2_actual = actual_entry * (1 + self.config.tp2_pct)
                     sl_actual = actual_entry * (1 - self.config.initial_sl_pct)
 
-                    # Record position
                     self._position = MomentumPosition(
                         side=signal.side,
                         entry_price=actual_entry,
-                        size=size,
+                        size=actual_filled,
                         entry_time=time.time(),
                         sl_price=sl_actual,
                     )
@@ -384,7 +429,6 @@ class MomentumBot:
                     self._last_entry_time = time.time()
                     self._entries_today += 1
 
-                    # Create exits object
                     exits_obj = MomentumExit(
                         tp1_price=tp1_actual,
                         tp2_price=tp2_actual,
@@ -399,8 +443,9 @@ class MomentumBot:
                     )
 
                     logger.info(
-                        f"==> MOMENTUM ENTERED: {signal.side.value.upper()} | ${size:.2f} @ {actual_entry:.3f} | "
-                        f"TP1: {tp1_actual:.3f} TP2: {tp2_actual:.3f} SL: {sl_actual:.3f}"
+                        "==> MOMENTUM ENTERED: %s | $%.2f @ %.3f | TP1: %.3f TP2: %.3f SL: %.3f",
+                        signal.side.value.upper(), actual_filled, actual_entry,
+                        tp1_actual, tp2_actual, sl_actual,
                     )
 
                     return {
@@ -415,24 +460,26 @@ class MomentumBot:
                 )
 
                 if is_balance_error:
-                    if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt  # 1s, 2s, 4s
-                        logger.warning("Momentum: balance error, retry %d/%d in %ds", attempt + 1, max_retries, wait_time)
-                        await asyncio.sleep(wait_time)
-                        continue
-                    else:
-                        self._balance_block_until = time.time() + 10
-                        logger.warning("Momentum: balance error on entry, blocking 10s")
+                    self._balance_block_until = time.time() + 10
+                    logger.error("==> MOM ENTRY FAILED: balance error — %s", result.message)
+                    return {"success": False, "reason": result.message}
 
-                return {"success": False, "reason": result.message}
+                logger.error(
+                    "==> MOM ENTRY FAILED: FAK rejected (attempt %d/%d) — %s",
+                    attempt + 1, max_retries, result.message,
+                )
+                # FAK rejection means no liquidity even with sweep — no point retrying immediately
 
             except Exception as e:
-                logger.error("Momentum execution failed: %s", e)
+                logger.error("==> MOM ENTRY FAILED: exception (attempt %d/%d) — %s",
+                             attempt + 1, max_retries, e)
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
                     continue
-                return {"success": False, "reason": str(e)}
 
+        return {"success": False, "reason": "all FAK attempts failed"}
+
+        logger.error("==> MOM ENTRY FAILED: max retries exceeded")
         return {"success": False, "reason": "max retries exceeded"}
     
     async def _cancel_all_exit_orders(self, pos: MomentumPosition):

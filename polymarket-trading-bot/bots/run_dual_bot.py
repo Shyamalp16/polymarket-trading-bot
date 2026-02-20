@@ -21,6 +21,7 @@ Environment Variables:
 import asyncio
 import argparse
 import logging
+import logging.handlers
 import os
 import sys
 from pathlib import Path
@@ -36,7 +37,8 @@ load_dotenv()
 from src.config import Config
 from src.bot import TradingBot
 from src.gamma_client import GammaClient
-from src.websocket_client import MarketWebSocket
+from src.websocket_client import MarketWebSocket, UserWebSocket
+from src.data_api_client import DataApiClient
 
 from lib.shared_state import SharedState
 from lib.btc_price import BTCPriceTracker
@@ -54,6 +56,21 @@ _root = logging.getLogger()
 _root.setLevel(logging.INFO)
 for _h in _root.handlers:
     _h.setFormatter(logging.Formatter(_LOG_FORMAT))
+
+# ── Persistent error log: logs/errors.log ─────────────────────────────────────
+# Captures every ERROR+ message from all loggers (including src.client HTTP 400s).
+# Written regardless of whether TUI is active; rotate at 1 MB, keep 5 backups.
+_logs_dir = project_root / "logs"
+_logs_dir.mkdir(exist_ok=True)
+_err_handler = logging.handlers.RotatingFileHandler(
+    _logs_dir / "errors.log",
+    maxBytes=1_000_000,
+    backupCount=5,
+    encoding="utf-8",
+)
+_err_handler.setLevel(logging.ERROR)
+_err_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+_root.addHandler(_err_handler)
 
 # Silence noisy loggers
 logging.getLogger("asyncio").setLevel(logging.WARNING)
@@ -92,10 +109,14 @@ class DualBotRunner:
         self.spread_bot: SpreadBot = None
         self.coordinator: Coordinator = None
 
+        # User-channel WebSocket (real-time fill notifications)
+        self.user_ws: UserWebSocket = None
+
         # Tasks
         self._ws_task: asyncio.Task = None
         self._btc_task: asyncio.Task = None
         self._coordination_task: asyncio.Task = None
+        self._user_ws_task: asyncio.Task = None
         self._running = False
     
     async def initialize(self):
@@ -167,8 +188,8 @@ class DualBotRunner:
             min_time_remaining=60,   # was 90s
             tp1_pct=0.22,
             tp2_pct=0.45,
-            early_sl_pct=0.40,
-            mid_sl_pct=0.35,
+            early_sl_pct=0.15,   # -15% early window  (was 40% — too wide, poor R:R)
+            mid_sl_pct=0.10,     # -10% mid/late window (tighten as expiry nears)
             min_signal_strength=0.25,  # was 0.3
             cooldown_seconds=60,
         )
@@ -183,14 +204,32 @@ class DualBotRunner:
 
         spread_config = SpreadConfig(
             bankroll=bankroll,
-            size_per_leg=5.0,
+            size_per_leg=15.0,        # 3× increase — SPR is near-risk-free once locked
             min_time_remaining=120,   # only spread if ≥2 min left in window
             target_low=0.44,          # spread when both sides near 50¢
             target_high=0.56,
             bid_offset=0.02,          # bid 2¢ below ask → maker pricing
+            min_locked_profit=0.40,   # require ≥2.7¢/share locked (15sh × $0.027)
             single_leg_cancel_window=90,
             single_leg_sl_pct=0.15,
         )
+
+        # Build the user-channel WebSocket from the derived CLOB API credentials.
+        # The credentials are guaranteed to exist after TradingBot.__init__ calls
+        # _derive_api_creds() synchronously in its constructor.
+        _api_creds = self.trading_bot._api_creds
+        if _api_creds and _api_creds.is_valid():
+            self.user_ws = UserWebSocket(
+                api_key=_api_creds.api_key,
+                secret=_api_creds.secret,
+                passphrase=_api_creds.passphrase,
+            )
+            logger.info("UserWebSocket created (apiKey=%s…)", _api_creds.api_key[:8])
+        else:
+            logger.warning(
+                "CLOB API credentials not available — user-channel WS disabled. "
+                "Fill detection will fall back to HTTP polling."
+            )
 
         self.momentum_bot = MomentumBot(
             self.trading_bot,
@@ -202,12 +241,14 @@ class DualBotRunner:
             self.trading_bot,
             self.shared_state,
             mr_config,
+            user_ws=self.user_ws,
         )
 
         self.spread_bot = SpreadBot(
             self.trading_bot,
             self.shared_state,
             spread_config,
+            user_ws=self.user_ws,
         )
 
         self.coordinator = Coordinator(
@@ -216,6 +257,7 @@ class DualBotRunner:
             self.shared_state,
             coord_config,
             spread_bot=self.spread_bot,
+            data_api=DataApiClient(),
         )
 
         # Initialize market manager (5-minute markets)
@@ -261,13 +303,58 @@ class DualBotRunner:
         # Start coordinator
         await self.coordinator.start()
 
+        # Register a real-time WS callback so every book event immediately
+        # pushes to shared_state — no 500 ms polling delay.
+        @self.market_manager.on_book_update
+        async def _on_ws_book(snapshot) -> None:  # pyright: ignore[reportUnusedFunction]
+            try:
+                up_book = self.market_manager.get_orderbook("up")
+                down_book = self.market_manager.get_orderbook("down")
+                if not up_book or not down_book:
+                    return
+                market = self.market_manager.current_market
+                if not market:
+                    return
+                mins, secs = market.get_countdown()
+                tte = mins * 60 + secs if mins >= 0 else 300
+                await self.shared_state.update_market(
+                    up_price=up_book.mid_price,
+                    down_price=down_book.mid_price,
+                    up_bids=[(b.price, b.size) for b in up_book.bids[:10]],
+                    up_asks=[(a.price, a.size) for a in up_book.asks[:10]],
+                    down_bids=[(b.price, b.size) for b in down_book.bids[:10]],
+                    down_asks=[(a.price, a.size) for a in down_book.asks[:10]],
+                    token_id_up=market.up_token,
+                    token_id_down=market.down_token,
+                    market_slug=market.slug,
+                    time_to_expiry=tte,
+                )
+            except Exception as e:
+                logger.debug("WS book push error: %s", e)
+
+        # Seed neg_risk cache for the initial market so place_order never
+        # needs to make a network call.  Also re-seed on every market rotation.
+        if self.market_manager.current_market:
+            self._seed_neg_risk_cache(self.market_manager.current_market)
+
+        @self.market_manager.on_market_change
+        def _on_market_change(market) -> None:  # pyright: ignore[reportUnusedFunction]
+            self._seed_neg_risk_cache(market)
+
         # Start background tasks
-        self._ws_task = asyncio.create_task(self._market_update_loop())
+        # _ws_task now runs a lightweight 1-second ticker that updates only
+        # time_to_expiry (countdown changes with wall clock, not WS events).
+        # Orderbook data is pushed in real-time by the callback above.
+        self._ws_task = asyncio.create_task(self._expiry_ticker_loop())
 
         if self.btc_price:
             self._btc_task = asyncio.create_task(self._btc_update_loop())
 
         self._coordination_task = asyncio.create_task(self._coordination_loop())
+
+        if self.user_ws:
+            self._user_ws_task = asyncio.create_task(self.user_ws.run())
+            logger.info("UserWebSocket task started")
 
         logger.info("Dual-bot system started")
     
@@ -276,7 +363,12 @@ class DualBotRunner:
         self._running = False
         
         # Cancel tasks
-        for task in (self._ws_task, self._btc_task, self._coordination_task):
+        for task in (
+            self._ws_task,
+            self._btc_task,
+            self._coordination_task,
+            self._user_ws_task,
+        ):
             if task:
                 task.cancel()
 
@@ -291,51 +383,42 @@ class DualBotRunner:
         
         logger.info("Dual-bot system stopped")
     
-    async def _market_update_loop(self):
-        """Update shared state from market data."""
+    def _seed_neg_risk_cache(self, market) -> None:
+        """Pre-populate clob_client._neg_risk_cache from Gamma market data.
+
+        Called at startup and on every market rotation so get_neg_risk()
+        returns instantly from cache without making any HTTP request.
+        BTC/ETH/SOL crypto markets are always neg_risk=False.
+        """
+        clob = self.trading_bot.clob_client
+        for token_id in market.token_ids.values():
+            if token_id:
+                clob.set_neg_risk(token_id, market.neg_risk)
+        logger.debug(
+            "neg_risk cache seeded for %s: neg_risk=%s",
+            market.slug, market.neg_risk,
+        )
+
+    async def _expiry_ticker_loop(self):
+        """Keep time_to_expiry current via a 1-second wall-clock tick.
+
+        Orderbook data is pushed in real-time by the on_book_update WS callback
+        registered in start().  This loop only needs to advance the countdown
+        because time_to_expiry changes with the clock, not with market events.
+        """
         while self._running:
             try:
-                # Get orderbook
-                up_book = self.market_manager.get_orderbook("up")
-                down_book = self.market_manager.get_orderbook("down")
-                
-                if up_book and down_book:
-                    market = self.market_manager.current_market
-                    
-                    # Convert orderbook to list of tuples (price, size)
-                    up_bids = [(b.price, b.size) for b in up_book.bids[:10]]
-                    up_asks = [(a.price, a.size) for a in up_book.asks[:10]]
-                    down_bids = [(b.price, b.size) for b in down_book.bids[:10]]
-                    down_asks = [(a.price, a.size) for a in down_book.asks[:10]]
-                    
-                    # Update shared state
-                    # P2-10: call get_countdown() once
-                    if market:
-                        mins, secs = market.get_countdown()
-                        time_to_expiry = mins * 60 + secs if mins >= 0 else 300
-                    else:
-                        time_to_expiry = 300
-
-                    await self.shared_state.update_market(
-                        up_price=up_book.mid_price,
-                        down_price=down_book.mid_price,
-                        up_bids=up_bids,
-                        up_asks=up_asks,
-                        down_bids=down_bids,
-                        down_asks=down_asks,
-                        token_id_up=market.up_token if market else "",
-                        token_id_down=market.down_token if market else "",
-                        market_slug=market.slug if market else "",
-                        time_to_expiry=time_to_expiry,
-                    )
-                
-                await asyncio.sleep(0.5)  # market update: 2 Hz
-
+                market = self.market_manager.current_market
+                if market:
+                    mins, secs = market.get_countdown()
+                    tte = mins * 60 + secs if mins >= 0 else 300
+                    await self.shared_state.update_expiry(tte)
+                await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Market update error: %s", e)
-                await asyncio.sleep(0.5)
+                logger.error("Expiry ticker error: %s", e)
+                await asyncio.sleep(1.0)
     
     async def _btc_update_loop(self):
         """Update shared state from BTC price."""

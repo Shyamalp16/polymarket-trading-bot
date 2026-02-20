@@ -209,11 +209,20 @@ class ApiClient(ThreadLocalSessionMixin):
                         error_body = response.text
                     except Exception:
                         error_body = "(could not read response body)"
-                    logger.error(
-                        f"HTTP {response.status_code} {method} {endpoint}: {error_body}"
-                    )
+                    body_lc_pre = error_body.lower()
+                    # "crosses book" is an expected transient condition — the
+                    # spread bot handles it with a price-adjusted retry.  Log
+                    # at WARNING so it doesn't land in the TUI error panel.
+                    if "crosses book" in body_lc_pre:
+                        logger.warning(
+                            f"HTTP {response.status_code} {method} {endpoint}: {error_body}"
+                        )
+                    else:
+                        logger.error(
+                            f"HTTP {response.status_code} {method} {endpoint}: {error_body}"
+                        )
 
-                    body_lc = error_body.lower()
+                    body_lc = body_lc_pre  # already computed above
 
                     # Balance/allowance errors are NOT retryable — break
                     # out immediately instead of wasting retries.
@@ -513,25 +522,44 @@ class ClobClient(ApiClient):
 
     def get_open_orders(self) -> List[Dict[str, Any]]:
         """
-        Get all open orders for the funder.
+        Get all open orders for the funder, following pagination cursors.
+
+        The CLOB API may return a paginated response:
+          {"data": [...], "next_cursor": "<token>", "count": N, "limit": N}
+        We follow next_cursor until it is absent, empty, or "LTE" (last page
+        sentinel used by Polymarket).
 
         Returns:
-            List of open orders
+            Complete list of open orders across all pages
         """
         endpoint = "/data/orders"
+        all_orders: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
 
-        headers = self._build_headers("GET", endpoint)
+        while True:
+            headers = self._build_headers("GET", endpoint)
+            params: Dict[str, Any] = {}
+            if cursor:
+                params["next_cursor"] = cursor
 
-        result = self._request(
-            "GET",
-            endpoint,
-            headers=headers
-        )
+            result = self._request("GET", endpoint, headers=headers, params=params or None)
 
-        # Handle paginated response
-        if isinstance(result, dict) and "data" in result:
-            return result.get("data", [])
-        return result if isinstance(result, list) else []
+            if isinstance(result, dict) and "data" in result:
+                page = result.get("data") or []
+                all_orders.extend(page)
+                next_cur = result.get("next_cursor", "")
+                # "LTE" is Polymarket's sentinel meaning "less than or equal to
+                # the last element" — i.e. no more pages.
+                if not next_cur or next_cur == "LTE":
+                    break
+                cursor = next_cur
+            elif isinstance(result, list):
+                all_orders.extend(result)
+                break
+            else:
+                break
+
+        return all_orders
 
     def get_order(self, order_id: str) -> Dict[str, Any]:
         """
@@ -550,35 +578,48 @@ class ClobClient(ApiClient):
     def get_trades(
         self,
         token_id: Optional[str] = None,
-        limit: int = 100
+        limit: int = 100,
+        max_pages: int = 10,
     ) -> List[Dict[str, Any]]:
         """
-        Get trade history.
+        Get trade history, following pagination cursors up to max_pages.
 
         Args:
             token_id: Filter by token (optional)
-            limit: Maximum number of trades
+            limit: Maximum number of trades per page
+            max_pages: Safety cap on total pages fetched (default 10 = 1 000 trades)
 
         Returns:
-            List of trades
+            Combined list of trades across all pages
         """
         endpoint = "/data/trades"
-        headers = self._build_headers("GET", endpoint)
-        params: Dict[str, Any] = {"limit": limit}
-        if token_id:
-            params["token_id"] = token_id
+        all_trades: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
 
-        result = self._request(
-            "GET",
-            endpoint,
-            headers=headers,
-            params=params
-        )
+        for _ in range(max_pages):
+            headers = self._build_headers("GET", endpoint)
+            params: Dict[str, Any] = {"limit": limit}
+            if token_id:
+                params["token_id"] = token_id
+            if cursor:
+                params["next_cursor"] = cursor
 
-        # Handle paginated response
-        if isinstance(result, dict) and "data" in result:
-            return result.get("data", [])
-        return result if isinstance(result, list) else []
+            result = self._request("GET", endpoint, headers=headers, params=params)
+
+            if isinstance(result, dict) and "data" in result:
+                page = result.get("data") or []
+                all_trades.extend(page)
+                next_cur = result.get("next_cursor", "")
+                if not next_cur or next_cur == "LTE":
+                    break
+                cursor = next_cur
+            elif isinstance(result, list):
+                all_trades.extend(result)
+                break
+            else:
+                break
+
+        return all_trades
 
     def get_balance_allowance(
         self,
@@ -605,38 +646,73 @@ class ClobClient(ApiClient):
             params["token_id"] = token_id
         return self._request("GET", endpoint, headers=headers, params=params)
 
-    def get_neg_risk(self, token_id: str) -> bool:
+    def get_fee_rate_bps(self, token_id: str) -> int:
         """
-        Check if a token belongs to a neg-risk market.
+        Return the fee rate in basis points required by the operator for a token.
 
-        Neg-risk markets use a different exchange contract for signing.
-        Result is cached per token_id to avoid repeated API calls.
+        Polymarket typically uses 0 bps for most markets, but the correct value
+        must be embedded in the signed order (feeRateBps field).  Using the
+        wrong value (e.g. 1000 = 10%) inflates makerAmount, causing
+        INVALID_ORDER_NOT_ENOUGH_BALANCE errors and worse fill prices.
+
+        Result is cached per token_id — fee rates are market-level constants
+        that never change within a window.
 
         Args:
             token_id: The conditional token ID
 
         Returns:
-            True if the market is neg-risk
+            Fee rate in basis points (usually 0)
         """
-        if not hasattr(self, "_neg_risk_cache"):
-            self._neg_risk_cache: Dict[str, bool] = {}
+        if not hasattr(self, "_fee_rate_cache"):
+            self._fee_rate_cache: Dict[str, int] = {}
 
-        if token_id in self._neg_risk_cache:
-            return self._neg_risk_cache[token_id]
+        if token_id in self._fee_rate_cache:
+            return self._fee_rate_cache[token_id]
 
-        endpoint = "/neg-risk"
+        endpoint = "/fee-rate"
         try:
             result = self._request(
                 "GET", endpoint, params={"token_id": token_id}
             )
-            neg_risk = bool(result.get("neg_risk", False))
+            fee_rate = int(result.get("fee_rate_bps", 0))
         except Exception:
-            neg_risk = False  # Assume non-neg-risk on error
-            logger.warning(f"Failed to query neg_risk for {token_id[:16]}..., defaulting to False")
+            fee_rate = 0  # Default to 0 on error — better than 1000 (10%)
+            logger.warning(
+                "Failed to query fee_rate_bps for %s..., defaulting to 0", token_id[:16]
+            )
 
-        self._neg_risk_cache[token_id] = neg_risk
-        logger.info(f"Token {token_id[:16]}... neg_risk={neg_risk}")
-        return neg_risk
+        self._fee_rate_cache[token_id] = fee_rate
+        logger.debug("Token %s... fee_rate_bps=%d", token_id[:16], fee_rate)
+        return fee_rate
+
+    def get_neg_risk(self, token_id: str) -> bool:
+        """
+        Check if a token belongs to a neg-risk market.
+
+        Neg-risk markets use a different exchange contract for signing.
+        The value is pre-populated from the Gamma API market data at startup
+        via set_neg_risk(); this method never makes a network call.
+
+        Args:
+            token_id: The conditional token ID
+
+        Returns:
+            True if the market is neg-risk (defaults to False)
+        """
+        if not hasattr(self, "_neg_risk_cache"):
+            self._neg_risk_cache: Dict[str, bool] = {}
+        return self._neg_risk_cache.get(token_id, False)
+
+    def set_neg_risk(self, token_id: str, value: bool) -> None:
+        """Pre-populate the neg-risk cache for a token.
+
+        Called at market startup with the value sourced from the Gamma API
+        (market.enableNegRisk) so get_neg_risk() never needs a network call.
+        """
+        if not hasattr(self, "_neg_risk_cache"):
+            self._neg_risk_cache: Dict[str, bool] = {}
+        self._neg_risk_cache[token_id] = value
 
     def update_balance_allowance(
         self,
@@ -676,14 +752,17 @@ class ClobClient(ApiClient):
     def post_order(
         self,
         signed_order: Dict[str, Any],
-        order_type: str = "GTC"
+        order_type: str = "GTC",
+        post_only: bool = False,
     ) -> Dict[str, Any]:
         """
         Submit a signed order.
 
         Args:
             signed_order: Order with signature
-            order_type: Order type (GTC, GTD, FOK)
+            order_type: Order type (GTC, GTD, FOK, FAK)
+            post_only: If True, reject if order would cross the spread.
+                       Only valid for GTC/GTD — ignored for FOK/FAK.
 
         Returns:
             Response with order ID and status
@@ -694,11 +773,13 @@ class ClobClient(ApiClient):
         owner = self.api_creds.api_key if (self.api_creds and self.api_creds.is_valid()) else self.funder
 
         # Build request body — signature is already inside the order dict
-        body = {
+        body: Dict[str, Any] = {
             "order": signed_order.get("order", signed_order),
             "owner": owner,
             "orderType": order_type,
         }
+        if post_only and order_type in ("GTC", "GTD"):
+            body["postOnly"] = True
 
         body_json = json.dumps(body, separators=(',', ':'))
         headers = self._build_headers("POST", endpoint, body_json)

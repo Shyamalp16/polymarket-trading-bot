@@ -57,8 +57,8 @@ class Order:
         side: Order side ('BUY' or 'SELL')
         maker: The maker's wallet address (Safe/Proxy)
         nonce: Unique order nonce (usually timestamp)
-        fee_rate_bps: Fee rate in basis points (usually 0)
-        signature_type: Signature type (2 = Gnosis Safe)
+    fee_rate_bps: Fee rate in basis points (1000 = 10%, as required by current Polymarket markets)
+    signature_type: Signature type (2 = Gnosis Safe)
     """
     token_id: str
     price: float
@@ -69,6 +69,7 @@ class Order:
     fee_rate_bps: int = 1000
     signature_type: int = 2
     order_type: str = "GTC"  # GTC, FOK, GTD, FAK
+    tick_size: float = 0.01  # per-market tick; updated via tick_size_change events
 
     def __post_init__(self):
         """Validate and normalize order parameters."""
@@ -84,6 +85,13 @@ class Order:
 
         if self.nonce is None:
             self.nonce = int(time.time())
+
+        # Snap price to the market's tick grid to avoid INVALID_ORDER_MIN_TICK_SIZE.
+        # tick_size_change events (e.g. when price crosses 0.96) update this field.
+        tick = max(self.tick_size, 1e-6)
+        self.price = round(round(self.price / tick) * tick, 6)
+        # Re-clamp after snap (rounding can push to 1.0 at extreme prices)
+        self.price = min(self.price, 0.99)
 
         is_market = self.order_type in ("FOK", "FAK")
 
@@ -101,15 +109,22 @@ class Order:
                 share_amount = round(self.size * 100) * 10000
                 usdc_amount = round(self.price * self.size * 10000) * 100
         else:
-            # GTC/GTD (limit) orders: price must be on 0.01 tick.
-            #   BUY:  makerAmount (USDC) → divisible by 100
-            #         takerAmount (shares) → divisible by 10,000
-            #   SELL: makerAmount (shares) → divisible by 10,000
-            #         takerAmount (USDC) → divisible by 100
-            price_cents = round(self.price * 100)
+            # GTC/GTD (limit) orders: price precision is determined by tick_size.
+            # Derive the number of decimal places from tick (0.01→2, 0.001→3, etc.)
+            # and keep amounts in exact integer arithmetic.
+            #   BUY:  makerAmount (USDC micro) → divisible by 100
+            #         takerAmount (share micro) → divisible by 10,000
+            #   SELL: makerAmount (share micro) → divisible by 10,000
+            #         takerAmount (USDC micro)  → divisible by 100
+            # Count decimal places: e.g. 0.01 → 2, 0.001 → 3
+            tick_str = f"{tick:.10f}".rstrip("0")
+            tick_decimals = len(tick_str.split(".")[-1]) if "." in tick_str else 0
+            scale = 10 ** tick_decimals          # 100 for 0.01, 1000 for 0.001
+            price_units = round(self.price * scale)
             size_hundredths = round(self.size * 100)
-            usdc_amount = price_cents * size_hundredths * 100   # divisible by 100
-            share_amount = size_hundredths * 10000              # divisible by 10,000
+            micro_per_unit = 1_000_000 // scale  # USDC micro per tick unit (10000 for 0.01)
+            usdc_amount = price_units * size_hundredths * micro_per_unit // 100
+            share_amount = size_hundredths * 10000
 
         if self.side == "BUY":
             self.maker_amount = str(usdc_amount)

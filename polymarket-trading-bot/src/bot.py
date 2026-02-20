@@ -329,18 +329,20 @@ class TradingBot:
         size: float,
         side: str,
         order_type: str = "GTC",
-        fee_rate_bps: int = 1000
+        tick_size: float = 0.01,
+        post_only: bool = False,
     ) -> OrderResult:
         """
-        Place a limit order.
+        Place an order.
 
         Args:
             token_id: Market token ID
             price: Price per share (0-1)
             size: Number of shares
             side: 'BUY' or 'SELL'
-            order_type: Order type (GTC, GTD, FOK)
-            fee_rate_bps: Fee rate in basis points
+            order_type: Order type (GTC, GTD, FOK, FAK)
+            tick_size: Market tick size (from WS tick_size_change events)
+            post_only: If True, reject if order would cross the spread (GTC/GTD only)
 
         Returns:
             OrderResult with order status
@@ -354,11 +356,17 @@ class TradingBot:
                 self.clob_client.get_neg_risk, token_id
             )
 
+            # Polymarket validates feeRateBps server-side and rejects orders
+            # where it doesn't match the market's configured fee.
+            # Current markets charge 1000 bps (10%) for both maker and taker.
+            fee_rate_bps = 1000
+
             # Clamp price to SDK maximum of 0.99
             price = min(price, 0.99)
 
-            # Create order (pass order_type so amounts satisfy
-            # the correct precision rules for GTC vs FOK/FAK)
+            # Create order — tick_size ensures price is snapped to the market's
+            # current grid (avoids INVALID_ORDER_MIN_TICK_SIZE rejections when
+            # the tick changes after a price crosses 0.96 or 0.04).
             order = Order(
                 token_id=token_id,
                 price=price,
@@ -367,6 +375,7 @@ class TradingBot:
                 maker=self.config.safe_address,
                 fee_rate_bps=fee_rate_bps,
                 order_type=order_type,
+                tick_size=tick_size,
             )
 
             # Sign order with correct exchange domain
@@ -378,6 +387,7 @@ class TradingBot:
                 self.clob_client.post_order,
                 signed,
                 order_type,
+                post_only,
             )
             record_latency(
                 "clob_post_order_ms",
@@ -385,12 +395,18 @@ class TradingBot:
                 {"side": side, "order_type": order_type},
             )
 
-            logger.info(
-                f"Order placed: {side} {size}@{price} "
-                f"(token: {token_id[:16]}..., neg_risk={neg_risk})"
-            )
-
-            return OrderResult.from_response(response)
+            result = OrderResult.from_response(response)
+            if result.success:
+                logger.info(
+                    "Order placed: %s %.2f@%.4f (token: %s… neg_risk=%s)",
+                    side, size, price, token_id[:16], neg_risk,
+                )
+            else:
+                logger.warning(
+                    "Order rejected by CLOB: %s %.2f@%.4f type=%s — %s",
+                    side, size, price, order_type, result.message,
+                )
+            return result
 
         except BalanceError as e:
             logger.warning(f"Balance/allowance error: {e}")

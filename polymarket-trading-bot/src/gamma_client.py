@@ -280,5 +280,8 @@ class GammaClient(ThreadLocalSessionMixin):
             "best_bid": market.get("bestBid"),
             "best_ask": market.get("bestAsk"),
             "spread": market.get("spread"),
+            # neg_risk drives which exchange contract is used for EIP-712 signing.
+            # BTC/ETH/SOL 5-minute markets are always False (standard CTF Exchange).
+            "neg_risk": bool(market.get("enableNegRisk", False)),
             "raw": market,
         }

@@ -37,11 +37,14 @@ import logging
 import time
 import statistics
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Deque
+from typing import Optional, Dict, Any, Deque, TYPE_CHECKING
 from collections import deque
 from enum import Enum
 
 from lib.shared_state import SharedState, MarketRegime
+
+if TYPE_CHECKING:
+    from src.websocket_client import UserWebSocket
 
 logger = logging.getLogger(__name__)
 
@@ -177,10 +180,12 @@ class MeanReversionBot:
         trading_bot,
         shared_state: SharedState,
         config: Optional[MeanReversionConfig] = None,
+        user_ws: Optional["UserWebSocket"] = None,
     ):
         self.bot = trading_bot
         self.state = shared_state
         self.config = config if config else MeanReversionConfig()
+        self._user_ws = user_ws
         
         # Position tracking
         self._position: Optional[MeanReversionPosition] = None
@@ -387,20 +392,30 @@ class MeanReversionBot:
         )
     
     def calculate_size(self, signal: ReversionSignal) -> float:
-        """Calculate position size in shares (min $1 value, max 10 shares)."""
+        """Calculate position size using half-Kelly criterion.
+
+        Scales shares between the 5-share floor and a 30-share cap based on
+        signal confidence and the trade's win/loss odds.  A high-confidence
+        signal (90%) at TP1=22% / SL=15% produces ~12-15 shares; a weak
+        signal (34%) falls to the 5-share floor.
+        """
         market = self.state.get_market_data()
-        mid_price = market.mid_price
+        mid_price = market.mid_price or 0.5
         if mid_price <= 0:
-            return 0
-        
-        # Calculate shares needed for minimum $1 order value
-        min_value_shares = 1.0 / mid_price  # e.g., 1/0.10 = 10 shares
-        
-        # Minimum 5 shares, or more if needed to hit $1 minimum
-        # Cap at 10 shares max
-        size_shares = max(5.0, min(min_value_shares, 10.0))
-        
-        return round(size_shares, 2)
+            return 5.0
+
+        # Kelly fraction: f = (b*p - q) / b, halved for safety
+        b = self.config.tp1_pct / max(self.config.early_sl_pct, 0.01)
+        p = max(0.0, min(1.0, signal.confidence))
+        q = 1.0 - p
+        raw_kelly = (b * p - q) / b
+        kelly_frac = max(0.0, raw_kelly) * 0.5   # half-Kelly
+
+        capital = self.config.bankroll * self.config.max_position_pct
+        dollar_size = capital * kelly_frac
+        shares = dollar_size / mid_price
+
+        return round(max(5.0, min(shares, 30.0)), 2)
     
     async def execute(self, signal: ReversionSignal, size_override: Optional[float] = None) -> Dict[str, Any]:
         """Execute mean reversion entry using maker-first, taker-escalation approach (P1-2).
@@ -458,14 +473,18 @@ class MeanReversionBot:
         window_remaining = market.time_to_expiry
         sl_pct = self.config.early_sl_pct if window_remaining > 180 else self.config.mid_sl_pct
 
-        # Phase 1: attempt post-only (GTX) maker order
+        # Phase 1: attempt post-only maker order (GTC + post_only=True).
+        # post_only rejects the order if it would cross the spread, giving us
+        # the same maker-only guarantee as the undocumented "GTX" type but
+        # using the official API parameter.
         try:
             maker_result = await self.bot.place_order(
                 token_id=token_id,
                 price=round(maker_price, 4),
                 size=size,
                 side=side,
-                order_type="GTX",
+                order_type="GTC",
+                post_only=True,
             )
 
             if maker_result.success:
@@ -487,11 +506,16 @@ class MeanReversionBot:
                 )
                 return {"success": True, "pending_maker": True, "reason": "maker_posted"}
 
-            # GTX rejected (e.g. would cross spread) — escalate directly to taker
-            logger.info("MR: GTX rejected (%s), escalating to FOK taker", maker_result.message)
+            # GTC post_only rejected (would cross spread) — escalate to FOK taker
+            logger.warning(
+                "==> MR MAKER REJECTED: post_only crossed spread — %s (falling back to FOK)",
+                maker_result.message,
+            )
 
         except Exception as e:
-            logger.error("MR: maker order failed: %s", e)
+            logger.error(
+                "==> MR MAKER REJECTED: exception — %s (falling back to FOK)", e
+            )
 
         # Phase 2 fallback: taker FOK
         return await self._execute_taker(signal, token_id, side, size, sl_pct, window_remaining)
@@ -505,13 +529,26 @@ class MeanReversionBot:
         sl_pct: float,
         window_remaining: int,
     ) -> Dict[str, Any]:
-        """Submit a FOK taker order and record the position on fill."""
-        max_retries = 3
+        """Submit a taker order and record the position on fill.
+
+        Regular MR entries use FOK (must fill entire size or cancel).
+        Expiry snipes use FAK (fill whatever depth is available, kill rest)
+        and sweep a few ticks above the best ask so they capture multiple
+        ask levels rather than dying on thin top-of-book liquidity.
+        """
+        is_snipe = signal.reason == "expiry_snipe"
+        max_retries = 3 if not is_snipe else 2  # snipes have limited time; fewer retries
+
         for attempt in range(max_retries):
             market = self.state.get_market_data()
-            # FOK orders must be marketable: BUY needs price >= best ask,
+
+            # Re-read window_remaining per attempt so SL tier selection stays
+            # accurate even after retry delays (FOK failures take some ms each).
+            current_window_remaining = market.time_to_expiry
+
+            # FOK/FAK orders must be marketable: BUY needs price >= best ask,
             # SELL needs price <= best bid.  Using the mid price causes every
-            # FOK to be rejected with FOK_ORDER_NOT_FILLED_ERROR because the
+            # order to be rejected with FOK_ORDER_NOT_FILLED_ERROR because the
             # signed makerAmount never crosses the resting offer.
             is_up = signal.side == ReversionSide.UP
             if side == "BUY":
@@ -526,18 +563,60 @@ class MeanReversionBot:
                     if is_up else
                     (market.down_bids[0][0] if market.down_bids else market.down_price)
                 )
-            exec_price = round(min(raw_price, 0.99), 4)
+
+            if is_snipe:
+                # Sweep 3 ticks above best ask to capture multiple depth levels.
+                # Even at ask+0.03 the $1.00 resolution on 85¢+ token is highly
+                # profitable.  FAK fills whatever is available and kills the rest
+                # so a partial fill is still a valid (and good) position.
+                exec_price = round(min(raw_price + 0.03, 0.99), 4)
+                order_type = "FAK"
+            else:
+                exec_price = round(min(raw_price, 0.99), 4)
+                order_type = "FOK"
+
             try:
                 result = await self.bot.place_order(
                     token_id=token_id,
                     price=exec_price,
                     size=size,
                     side=side,
-                    order_type="FOK",
+                    order_type=order_type,
                 )
 
                 if result.success:
-                    return self._record_fill(signal, exec_price, size, sl_pct, window_remaining, token_id)
+                    if is_snipe and result.order_id:
+                        # For FAK, the POST response often reports size_matched=0
+                        # even when shares were filled.  Query the settled order.
+                        try:
+                            order_data = await self.bot.get_order(result.order_id)
+                            raw = (
+                                (order_data or {}).get("size_matched")
+                                or (order_data or {}).get("sizeMatched")
+                                or 0
+                            )
+                            actual_filled = float(raw)
+                        except Exception:
+                            actual_filled = size  # assume full fill on query failure
+                        if actual_filled < 5.0:
+                            logger.warning(
+                                "==> SNIPE FAK partial fill too small (%.2f sh < 5.0 min) — skip",
+                                actual_filled,
+                            )
+                            return {"success": False, "reason": f"partial fill too small: {actual_filled}"}
+                        logger.info(
+                            "SNIPE FAK filled %.2f / %.2f sh @ %.4f",
+                            actual_filled, size, exec_price,
+                        )
+                        return self._record_fill(
+                            signal, exec_price, actual_filled, sl_pct,
+                            current_window_remaining, token_id,
+                        )
+
+                    return self._record_fill(
+                        signal, exec_price, size, sl_pct,
+                        current_window_remaining, token_id,
+                    )
 
                 is_balance_error = result.message and (
                     "balance" in result.message.lower() or "allowance" in result.message.lower()
@@ -545,6 +624,7 @@ class MeanReversionBot:
                 is_fok_error = result.message and (
                     "couldn't be fully filled" in result.message.lower()
                     or "not enough liquidity" in result.message.lower()
+                    or "no orders found" in result.message.lower()
                 )
 
                 if is_balance_error:
@@ -552,21 +632,33 @@ class MeanReversionBot:
                         await asyncio.sleep(2 ** attempt)
                         continue
                     self._balance_block_until = time.time() + 10
-                    logger.warning("MR: balance error on taker entry, blocking 10s")
+                    logger.error(
+                        "==> MR ENTRY FAILED: balance error — %s", result.message
+                    )
+                    return {"success": False, "reason": result.message}
 
+                # FOK/FAK liquidity failure — retry immediately (no sleep).
+                # The ask price is re-read at the top of the next loop iteration
+                # so there is no point waiting; we just want the freshest book.
                 if is_fok_error and attempt < max_retries - 1:
-                    await asyncio.sleep(1 + attempt * 0.5)
                     continue
 
+                # Final attempt or non-retryable rejection
+                logger.error(
+                    "==> MR ENTRY FAILED: %s rejected (attempt %d/%d) — %s",
+                    order_type, attempt + 1, max_retries, result.message,
+                )
                 return {"success": False, "reason": result.message}
 
             except Exception as e:
                 logger.error("MR taker execution failed: %s", e)
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
                     continue
+                logger.error("==> MR ENTRY FAILED: exception — %s", e)
                 return {"success": False, "reason": str(e)}
 
+        logger.error("==> MR ENTRY FAILED: max retries exceeded")
         return {"success": False, "reason": "max retries exceeded"}
 
     def _record_fill(
@@ -608,8 +700,11 @@ class MeanReversionBot:
             mercy_sl_pct=self.config.mercy_sl_pct,
         )
 
-        # P2-2: schedule exit orders as background task — do NOT sleep here
-        asyncio.create_task(self._place_exit_limit_orders(self._position, exits_obj))
+        # P2-2: schedule exit orders as background task — do NOT sleep here.
+        # Snipe positions hold to on-chain resolution ($1.00 payout) — no TPs needed.
+        # Only the SL (checked in check_exit) protects against a wrong-direction move.
+        if not is_snipe:
+            asyncio.create_task(self._place_exit_limit_orders(self._position, exits_obj))
 
         logger.info(
             f"==> MR ENTERED: {signal.side.value.upper()} | ${size:.2f} @ {actual_entry:.3f} | "
@@ -620,13 +715,22 @@ class MeanReversionBot:
 
     async def _poll_order_status(self, order_id: str) -> Optional[str]:
         """
-        Poll order status using two methods:
-          1. get_order(order_id)  — specific order lookup
-          2. get_open_orders()   — fallback if (1) fails or returns None
+        Return the current status of an order.
+
+        Resolution order (fastest first):
+          0. User-channel WebSocket fill event — O(1), no network round-trip.
+             Returns "matched" immediately if MATCHED was received.
+          1. GET /data/orders/{id} — specific order lookup.
+          2. GET /data/open-orders — fallback if (1) fails or returns None.
 
         Returns lowercase status string ("matched", "cancelled", "live", …)
-        or None if both methods fail.
+        or None if all methods fail.
         """
+        # Method 0: user-channel WS — instant, no I/O
+        if self._user_ws and self._user_ws.is_filled(order_id):
+            logger.info("MR: WS fill event — order %s… matched", order_id[:8])
+            return "matched"
+
         # Method 1: direct order lookup
         try:
             data = await self.bot.get_order(order_id)   # wrapper returns None on error
@@ -710,9 +814,12 @@ class MeanReversionBot:
         now   = time.time()
         elapsed = now - self._maker_order_time
 
-        # ── Throttled fill check (every 5 s to avoid API rate-limits) ──────────
+        # ── Throttled fill check ──────────────────────────────────────────────
+        # With the user-channel WS, _poll_order_status Method 0 is O(1) (no I/O),
+        # so we can check every 0.5 s.  Without WS we keep the 5 s HTTP rate limit.
+        _fill_check_interval = 0.5 if self._user_ws else 5.0
         last_check = order.get("_last_fill_check", 0.0)
-        if now - last_check >= 5.0:
+        if now - last_check >= _fill_check_interval:
             self._pending_maker_order["_last_fill_check"] = now
 
             order_status = await self._poll_order_status(order["order_id"])
@@ -778,13 +885,18 @@ class MeanReversionBot:
                     price=improved_price,
                     size=order["size"],
                     side=order["side"],
-                    order_type="GTX",
+                    order_type="GTC",
+                    post_only=True,
                 )
                 if improved.success:
                     self._pending_maker_order["order_id"] = improved.order_id
                     self._pending_maker_order["price"] = improved_price
                     self._pending_maker_order["_last_fill_check"] = 0.0  # force check on next cycle
-                    self._maker_order_time = time.time()
+                    # NOTE: intentionally NOT resetting _maker_order_time here.
+                    # Resetting it would restart the improve window and cause the bot
+                    # to keep nudging the price every 4s indefinitely.
+                    # The original timer continues so we only improve once (4-8s window)
+                    # then fall through to escalation/expiry as intended.
                     logger.info("MR: improved maker order to %.3f", improved_price)
                     return None
             except Exception as e:
@@ -899,8 +1011,18 @@ class MeanReversionBot:
             logger.warning("MR: cannot place exit orders — no token_id (market rotated?)")
             return
 
+        _MIN_ORDER = 5.0   # Polymarket minimum order size in shares
         tp1_size = round(pos.size * 0.30, 2)
         tp2_size = round(pos.size * 0.30, 2)
+
+        if tp1_size < _MIN_ORDER or tp2_size < _MIN_ORDER:
+            # Position too small for proportional GTC TPs — software check_exit()
+            # still monitors TP levels and fires a FAK sell when price is reached.
+            logger.info(
+                "MR: position %.2f sh too small for GTC TPs (%.2f sh each < min %s) — software-only exit",
+                pos.size, tp1_size, _MIN_ORDER,
+            )
+            return
 
         tp1_price = max(0.01, min(0.99, round(exits.tp1_price, 4)))
         tp2_price = max(0.01, min(0.99, round(exits.tp2_price, 4)))
@@ -1162,15 +1284,17 @@ class MeanReversionBot:
         if not pos.sl_order_id and current_price <= pos.sl_price and position_value >= 0.10:
             return {"action": "sell", "size": pos.size, "reason": "SL"}
 
-        # TP1 — skip if a resting GTC TP1 order is handling this level
-        if not pos.tp1_order_id and not pos.tp1_filled and position_value >= 0.10:
+        # TP1 — skip for snipe positions (hold to $1.00 on-chain resolution)
+        #       skip if a resting GTC TP1 order is already handling this level
+        if not pos.is_snipe and not pos.tp1_order_id and not pos.tp1_filled and position_value >= 0.10:
             if current_price >= tp1_threshold:
                 logger.info("MR TP1 TRIGGERED: entry=%.4f cur=%.4f", pos.entry_price, current_price)
                 pos.tp1_filled = True
                 return {"action": "sell", "size": pos.size * 0.30, "reason": "TP1"}
 
-        # TP2 — skip if a resting GTC TP2 order is handling this level
-        if not pos.tp2_order_id and pos.tp1_filled and not pos.tp2_filled and position_value >= 0.10:
+        # TP2 — skip for snipe positions (hold to $1.00 on-chain resolution)
+        #       skip if a resting GTC TP2 order is already handling this level
+        if not pos.is_snipe and not pos.tp2_order_id and pos.tp1_filled and not pos.tp2_filled and position_value >= 0.10:
             if current_price >= tp2_threshold:
                 logger.info("MR TP2 TRIGGERED: entry=%.4f cur=%.4f", pos.entry_price, current_price)
                 pos.tp2_filled = True
@@ -1249,7 +1373,8 @@ class MeanReversionBot:
              fully-exhausted call sequences.
         """
         MAX_CLOSE_ATTEMPTS = 8   # retries per close_position() call
-        PRICE_STEP = 0.02        # drop sell price 2 ticks each retry
+        PRICE_STEP = 0.03        # drop sell price 3 ticks each retry
+        NO_MATCH_STEP = 0.08     # much larger drop when book is empty
         BALANCE_POLLS = 3        # CLOB balance polls before first order
         FORCE_CLEAR_CALLS = 3    # fully-failed calls before force-clear
 
@@ -1428,11 +1553,21 @@ class MeanReversionBot:
                 await asyncio.sleep(wait)
                 continue
 
+            if "no orders found" in err_msg.lower():
+                # Bid book is empty — no buyers at any normal price.
+                # Jump down hard so the next attempt sweeps to near the floor.
+                initial_price = max(0.01, sell_price - NO_MATCH_STEP)
+                logger.warning(
+                    "MR close: empty bid book (attempt %d) — jumping price floor to %.3f",
+                    attempt + 1, initial_price,
+                )
+                continue
+
             # No fill at this price — lower price on next attempt, no extra wait
             logger.debug("MR close: FAK no fill @ %.4f (attempt %d), retrying lower",
                          sell_price, attempt + 1)
 
-        # ── All attempts exhausted for this call ──────────────────────────────
+        # ── All FAK attempts exhausted ─────────────────────────────────────────
         if remaining < sell_size:
             # At least partially closed — log as ERROR so it appears in the
             # TUI's sticky CLOSE FAILURES panel (warning is filtered out).
@@ -1442,6 +1577,32 @@ class MeanReversionBot:
             logger.error("==> MR CLOSE PARTIAL: %s | sold %.2f/%.2f sh | PnL: %s | remaining %.2f",
                          reason.upper(), sell_size - remaining, sell_size, pnl_str, remaining)
             return {"success": False, "partial": True, "pnl": total_pnl, "remaining": remaining}
+
+        # ── Last-resort: GTC limit sell at floor price ─────────────────────────
+        # All FAK attempts hit an empty bid book. Place a resting GTC sell at
+        # 0.01 so the order sits on the book and captures any future bids or
+        # the on-chain resolution payout.  Then force-clear the position tracker
+        # so we don't keep hammering a dead book.
+        try:
+            gtc_res = await self.bot.place_order(
+                token_id=token_id,
+                price=0.01,
+                size=remaining,
+                side="SELL",
+                order_type="GTC",
+            )
+            if gtc_res.success:
+                logger.error(
+                    "==> MR CLOSE GTC-FLOOR: %s | %.2f sh @ 0.01 (order %s) — empty book",
+                    reason.upper(), remaining, gtc_res.order_id,
+                )
+            else:
+                logger.error(
+                    "==> MR CLOSE GTC-FLOOR FAILED: %s | %.2f sh | %s",
+                    reason.upper(), remaining, gtc_res.message,
+                )
+        except Exception as e:
+            logger.error("==> MR CLOSE GTC-FLOOR EXCEPTION: %s", e)
 
         self._failed_close_attempts += 1
         logger.error("==> MR CLOSE FAILED: %s | attempt %d | reason: all %d retries exhausted (0 fills)",
@@ -1522,12 +1683,48 @@ class MeanReversionBot:
         posted for the previous window's token_id stays open in the CLOB
         forever — and once the window state resets (mr_had_position = False),
         the bot posts a second GTX for the new window on top of the first.
+
+        IMPORTANT: checks for a fill BEFORE cancelling.  If the order filled
+        while the bot wasn't looking (e.g., rapid price move at end of window),
+        the position is recorded so check_exit() can manage it going forward
+        rather than silently orphaning a real open position.
         """
         order = self._pending_maker_order
         if not order:
             return
 
         order_id = order.get("order_id", "")
+
+        # --- Check if already filled before attempting cancel ---
+        try:
+            fill_status = await self._poll_order_status(order_id)
+            if fill_status is not None and "match" in fill_status:
+                try:
+                    data = await self.bot.get_order(order_id)
+                    filled_size = float(
+                        (data or {}).get("size_matched") or
+                        (data or {}).get("size") or
+                        order.get("size", 0)
+                    )
+                except Exception:
+                    filled_size = float(order.get("size", 0))
+                if filled_size > 0:
+                    logger.warning(
+                        "MR: maker order %s… was filled (%.2f sh @ %.4f) but untracked — "
+                        "recording position on market reset",
+                        order_id[:8], filled_size, order.get("price", 0),
+                    )
+                    self._record_fill(
+                        order["signal"], order["price"], filled_size,
+                        order["sl_pct"], order["window_remaining"],
+                        order["token_id"],
+                    )
+                    self._pending_maker_order = None
+                    return
+        except Exception as e:
+            logger.warning("MR: fill check before cancel failed: %s", e)
+
+        # Not filled — safe to cancel
         try:
             clob = self.bot.clob_client
             await self.bot._run_in_thread(clob.cancel_order, order_id)

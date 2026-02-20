@@ -185,6 +185,8 @@ class LastTradePrice:
 BookCallback = Callable[[OrderbookSnapshot], Union[None, Awaitable[None]]]
 PriceChangeCallback = Callable[[str, List[PriceChange]], Union[None, Awaitable[None]]]
 TradeCallback = Callable[[LastTradePrice], Union[None, Awaitable[None]]]
+UserOrderCallback = Callable[[Dict[str, Any]], Union[None, Awaitable[None]]]
+UserTradeCallback = Callable[[Dict[str, Any]], Union[None, Awaitable[None]]]
 ErrorCallback = Callable[[Exception], None]
 
 
@@ -239,8 +241,12 @@ class MarketWebSocket:
         self._running = False
         self._subscribed_assets: Set[str] = set()
 
-        # Orderbook cache
+        # Orderbook cache (full snapshots from "book" events)
         self._orderbooks: Dict[str, OrderbookSnapshot] = {}
+
+        # Per-token tick size cache — updated via "tick_size_change" events.
+        # Key: asset_id (token ID), value: tick size float (e.g. 0.01, 0.001)
+        self._tick_sizes: Dict[str, float] = {}
 
         # Callbacks
         self._on_book: Optional[BookCallback] = None
@@ -280,6 +286,10 @@ class MarketWebSocket:
         """Get mid price for asset."""
         ob = self._orderbooks.get(asset_id)
         return ob.mid_price if ob else 0.0
+
+    def get_tick_size(self, asset_id: str, default: float = 0.01) -> float:
+        """Return the current tick size for an asset (updated by tick_size_change events)."""
+        return self._tick_sizes.get(asset_id, default)
 
     # Callback decorators
     def on_book(self, callback: BookCallback) -> BookCallback:
@@ -377,7 +387,9 @@ class MarketWebSocket:
 
         subscribe_msg = {
             "assets_ids": asset_ids,
-            "type": "MARKET",
+            "type": "market",               # must be lowercase per Polymarket docs
+            "custom_feature_enabled": True, # enables tick_size_change, best_bid_ask,
+                                            # new_market, market_resolved events
         }
 
         try:
@@ -413,6 +425,7 @@ class MarketWebSocket:
         subscribe_msg = {
             "assets_ids": asset_ids,
             "operation": "subscribe",
+            "custom_feature_enabled": True,
         }
 
         try:
@@ -468,6 +481,16 @@ class MarketWebSocket:
                 PriceChange.from_dict(pc)
                 for pc in data.get("price_changes", [])
             ]
+            # Patch the cached orderbook's top-of-book from each price_change entry
+            # so best_bid / best_ask stay live between full "book" snapshots.
+            for pc in changes:
+                ob = self._orderbooks.get(pc.asset_id)
+                if ob is not None and pc.best_bid > 0 and pc.best_ask < 1:
+                    # Replace just the top level; full depth is refreshed on next "book"
+                    if pc.best_bid != ob.best_bid:
+                        ob.bids = [OrderbookLevel(pc.best_bid, ob.bids[0].size if ob.bids else 0.0)] + ob.bids[1:]
+                    if pc.best_ask != ob.best_ask:
+                        ob.asks = [OrderbookLevel(pc.best_ask, ob.asks[0].size if ob.asks else 0.0)] + ob.asks[1:]
             await self._run_callback(
                 self._on_price_change,
                 market,
@@ -480,8 +503,21 @@ class MarketWebSocket:
             await self._run_callback(self._on_trade, trade, label="trade")
 
         elif event_type == "tick_size_change":
-            # Log but don't handle specially
-            logger.debug(f"Tick size change: {data}")
+            # Cache the new tick size so Order builders can read it.
+            # Fires when a market's price crosses 0.96 (or drops below 0.04).
+            asset_id = data.get("asset_id", "")
+            new_tick = data.get("new_tick_size", "")
+            if asset_id and new_tick:
+                try:
+                    self._tick_sizes[asset_id] = float(new_tick)
+                    logger.info(
+                        "Tick size change: asset=%s  %s → %s",
+                        asset_id[:16],
+                        data.get("old_tick_size", "?"),
+                        new_tick,
+                    )
+                except ValueError:
+                    logger.warning("Could not parse tick size: %s", new_tick)
 
         else:
             logger.debug(f"Unknown event type: {event_type}")
@@ -497,43 +533,65 @@ class MarketWebSocket:
         except Exception as e:
             logger.error(f"Error in {label} callback: {e}")
 
-    async def _run_loop(self) -> None:
-        """Main message processing loop."""
-        msg_count = 0
+    async def _ping_loop(self) -> None:
+        """Send application-level 'PING' text every 10 s.
+
+        Polymarket's WS server requires the string 'PING' (not a WebSocket
+        protocol PING frame) every 10 seconds or it closes the connection.
+        The server responds with 'PONG' which _run_loop silently discards.
+        """
         while self._running and self.is_connected:
             try:
-                message = await asyncio.wait_for(
-                    self._ws.recv(),
-                    timeout=self.ping_interval + 5
-                )
-                msg_count += 1
-
-                # Log first 5 messages, then every 1000
-                if msg_count <= 5 or msg_count % 1000 == 0:
-                    logger.info(f"WS message #{msg_count}: {message[:200] if len(message) > 200 else message}")
-
-                started = time.perf_counter()
-                data = _json_loads(message)
-                record_latency("ws_parse_ms", (time.perf_counter() - started) * 1000.0)
-
-                # Handle array of messages
-                if isinstance(data, list):
-                    for item in data:
-                        await self._handle_message(item)
-                else:
-                    await self._handle_message(data)
-
-            except asyncio.TimeoutError:
-                logger.warning("WebSocket receive timeout")
-            except self._connection_closed as e:
-                logger.warning(f"WebSocket connection closed: {e}")
+                await self._ws.send("PING")
+            except Exception:
                 break
-            except ValueError as e:
-                logger.error(f"Failed to parse message: {e}")
-            except Exception as e:
-                logger.error(f"Error processing message: {e}")
-                if self._on_error:
-                    self._on_error(e)
+            await asyncio.sleep(10)
+
+    async def _run_loop(self) -> None:
+        """Main message processing loop; runs alongside _ping_loop."""
+        msg_count = 0
+        ping_task = asyncio.ensure_future(self._ping_loop())
+        try:
+            while self._running and self.is_connected:
+                try:
+                    message = await asyncio.wait_for(
+                        self._ws.recv(),
+                        timeout=self.ping_interval + 5
+                    )
+                    msg_count += 1
+
+                    # Log first 5 messages, then every 1000
+                    if msg_count <= 5 or msg_count % 1000 == 0:
+                        logger.info(f"WS message #{msg_count}: {message[:200] if len(message) > 200 else message}")
+
+                    # Application-level PONG — discard silently
+                    if message == "PONG":
+                        continue
+
+                    started = time.perf_counter()
+                    data = _json_loads(message)
+                    record_latency("ws_parse_ms", (time.perf_counter() - started) * 1000.0)
+
+                    # Handle array of messages
+                    if isinstance(data, list):
+                        for item in data:
+                            await self._handle_message(item)
+                    else:
+                        await self._handle_message(data)
+
+                except asyncio.TimeoutError:
+                    logger.warning("WebSocket receive timeout")
+                except self._connection_closed as e:
+                    logger.warning(f"WebSocket connection closed: {e}")
+                    break
+                except ValueError as e:
+                    logger.error(f"Failed to parse message: {e}")
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}")
+                    if self._on_error:
+                        self._on_error(e)
+        finally:
+            ping_task.cancel()
 
     async def run(self, auto_reconnect: bool = True) -> None:
         """
@@ -585,6 +643,319 @@ class MarketWebSocket:
             await self.run(auto_reconnect=True)
         except asyncio.CancelledError:
             await self.disconnect()
+
+    def stop(self) -> None:
+        """Stop the WebSocket client."""
+        self._running = False
+
+
+class UserWebSocket:
+    """
+    Authenticated WebSocket client for Polymarket user-level events.
+
+    Connects to the /ws/user channel and receives:
+    - Trade events (MATCHED → MINED → CONFIRMED) for the authenticated user
+    - Order lifecycle events (PLACEMENT, UPDATE, CANCELLATION)
+
+    Uses asyncio.Event per order_id so bots can await fill notification
+    without polling GET /data/orders/{id} every 5 seconds.
+
+    Example::
+
+        uw = UserWebSocket(api_key=..., secret=..., passphrase=...)
+        asyncio.create_task(uw.run())
+
+        # In bot — register interest then wait:
+        result = await uw.wait_for_fill(order_id, timeout=60.0)
+        if result is None:
+            # timed out — poll as fallback
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        secret: str,
+        passphrase: str,
+        url: str = WSS_USER_URL,
+        reconnect_interval: float = 5.0,
+        max_reconnect_interval: float = 30.0,
+        ping_interval: float = 20.0,
+        ping_timeout: float = 10.0,
+    ):
+        self.url = url
+        self._api_key = api_key
+        self._secret = secret
+        self._passphrase = passphrase
+        self.reconnect_interval = reconnect_interval
+        self.max_reconnect_interval = max_reconnect_interval
+        self.ping_interval = ping_interval
+        self.ping_timeout = ping_timeout
+
+        self._ws_connect, self._connection_closed = _load_websockets()
+
+        self._ws: Optional["WebSocketClientProtocol"] = None
+        self._running = False
+
+        # Per order_id fill tracking.
+        # Keyed by order_id (string).  Event is set() when status == MATCHED.
+        self._fill_events: Dict[str, asyncio.Event] = {}
+        # Stores the last data payload that caused a fill event.
+        self._fill_data: Dict[str, Dict[str, Any]] = {}
+        # Latest order state per order_id (for UPDATE/CANCELLATION tracking).
+        self._order_snapshots: Dict[str, Dict[str, Any]] = {}
+
+        # Optional callbacks
+        self._on_order: Optional[UserOrderCallback] = None
+        self._on_trade: Optional[UserTradeCallback] = None
+        self._on_connect: Optional[Callable[[], None]] = None
+        self._on_disconnect: Optional[Callable[[], None]] = None
+
+    # ── Properties ────────────────────────────────────────────────────────────
+
+    @property
+    def is_connected(self) -> bool:
+        if self._ws is None:
+            return False
+        try:
+            from websockets.protocol import State
+            return self._ws.state == State.OPEN
+        except (ImportError, AttributeError):
+            try:
+                return self._ws.open
+            except AttributeError:
+                return False
+
+    # ── Callback decorators ───────────────────────────────────────────────────
+
+    def on_order(self, callback: UserOrderCallback) -> UserOrderCallback:
+        """Set callback for order lifecycle events (PLACEMENT/UPDATE/CANCELLATION)."""
+        self._on_order = callback
+        return callback
+
+    def on_trade(self, callback: UserTradeCallback) -> UserTradeCallback:
+        """Set callback for trade events (MATCHED/MINED/CONFIRMED/…)."""
+        self._on_trade = callback
+        return callback
+
+    def on_connect(self, callback: Callable[[], None]) -> Callable[[], None]:
+        self._on_connect = callback
+        return callback
+
+    def on_disconnect(self, callback: Callable[[], None]) -> Callable[[], None]:
+        self._on_disconnect = callback
+        return callback
+
+    # ── Fill tracking API ─────────────────────────────────────────────────────
+
+    def _get_or_create_fill_event(self, order_id: str) -> asyncio.Event:
+        if order_id not in self._fill_events:
+            self._fill_events[order_id] = asyncio.Event()
+        return self._fill_events[order_id]
+
+    def is_filled(self, order_id: str) -> bool:
+        """Non-blocking: return True if a MATCHED trade event was received for this order."""
+        ev = self._fill_events.get(order_id)
+        return ev is not None and ev.is_set()
+
+    async def wait_for_fill(
+        self, order_id: str, timeout: float = 30.0
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Await fill notification for an order.
+
+        Returns the trade payload dict on fill, or None on timeout.
+        Safe to call before the order is placed — the event is created lazily.
+        """
+        ev = self._get_or_create_fill_event(order_id)
+        if ev.is_set():
+            return self._fill_data.get(order_id)
+        try:
+            await asyncio.wait_for(asyncio.shield(ev.wait()), timeout=timeout)
+            return self._fill_data.get(order_id)
+        except asyncio.TimeoutError:
+            return None
+
+    def _mark_filled(self, order_id: str, payload: Dict[str, Any]) -> None:
+        """Internal: record fill data and set the asyncio.Event for this order."""
+        self._fill_data[order_id] = payload
+        self._get_or_create_fill_event(order_id).set()
+
+    # ── Connection ────────────────────────────────────────────────────────────
+
+    async def connect(self) -> bool:
+        try:
+            if self._ws_connect is None:
+                raise RuntimeError("websockets is not installed")
+            self._ws = await self._ws_connect(
+                self.url,
+                ping_interval=self.ping_interval,
+                ping_timeout=self.ping_timeout,
+            )
+            logger.info("UserWebSocket connected to %s", self.url)
+            if self._on_connect:
+                self._on_connect()
+            return True
+        except Exception as e:
+            logger.error("UserWebSocket connection failed: %s", e)
+            return False
+
+    async def disconnect(self) -> None:
+        self._running = False
+        if self._ws:
+            await self._ws.close()
+            self._ws = None
+            logger.info("UserWebSocket disconnected")
+            if self._on_disconnect:
+                self._on_disconnect()
+
+    # ── Subscription ──────────────────────────────────────────────────────────
+
+    async def _send_subscribe(self) -> None:
+        """Send authenticated subscription message to the user channel."""
+        sub_msg = {
+            "type": "user",
+            "markets": [],  # empty = receive all events for this api key
+            "auth": {
+                "apiKey": self._api_key,
+                "secret": self._secret,
+                "passphrase": self._passphrase,
+            },
+        }
+        await self._ws.send(_json_dumps(sub_msg))
+        logger.info("UserWebSocket: subscribed (apiKey=%s…)", self._api_key[:8])
+
+    # ── Message handling ──────────────────────────────────────────────────────
+
+    async def _handle_message(self, data: Dict[str, Any]) -> None:
+        event_type = data.get("event_type", "")
+
+        if event_type == "trade":
+            status = (data.get("status") or "").upper()
+            if status == "MATCHED":
+                # Mark taker order as filled
+                taker_id = data.get("taker_order_id", "")
+                if taker_id:
+                    self._mark_filled(taker_id, data)
+                    logger.info(
+                        "UserWS: taker MATCHED order_id=%s… price=%s size=%s",
+                        taker_id[:12], data.get("price", "?"), data.get("size", "?"),
+                    )
+                # Mark each matched maker order as filled
+                for mo in data.get("maker_orders", []):
+                    maker_id = mo.get("order_id", "")
+                    if maker_id:
+                        self._mark_filled(maker_id, data)
+                        logger.info(
+                            "UserWS: maker MATCHED order_id=%s… matched_amount=%s",
+                            maker_id[:12], mo.get("matched_amount", "?"),
+                        )
+            await self._run_callback(self._on_trade, data, label="user_trade")
+
+        elif event_type == "order":
+            order_id = data.get("id", "")
+            msg_type = data.get("type", "")
+            if order_id:
+                self._order_snapshots[order_id] = data
+            logger.debug("UserWS: order event type=%s id=%s…", msg_type, order_id[:12] if order_id else "?")
+            await self._run_callback(self._on_order, data, label="user_order")
+
+        else:
+            logger.debug("UserWS: unknown event_type=%s", event_type)
+
+    async def _run_callback(
+        self, callback: Optional[Callable[..., Any]], *args: Any, label: str
+    ) -> None:
+        if not callback:
+            return
+        try:
+            result = callback(*args)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:
+            logger.error("Error in %s callback: %s", label, e)
+
+    # ── Ping loop ─────────────────────────────────────────────────────────────
+
+    async def _ping_loop(self) -> None:
+        """Send application-level PING every 10 s to keep the connection alive."""
+        while self._running and self.is_connected:
+            try:
+                await self._ws.send("PING")
+            except Exception:
+                break
+            await asyncio.sleep(10)
+
+    # ── Main run loop ─────────────────────────────────────────────────────────
+
+    async def _run_loop(self) -> None:
+        ping_task = asyncio.ensure_future(self._ping_loop())
+        msg_count = 0
+        try:
+            while self._running and self.is_connected:
+                try:
+                    message = await asyncio.wait_for(
+                        self._ws.recv(), timeout=self.ping_interval + 5
+                    )
+                    msg_count += 1
+
+                    if message == "PONG":
+                        continue
+
+                    data = _json_loads(message)
+                    if isinstance(data, list):
+                        for item in data:
+                            await self._handle_message(item)
+                    else:
+                        await self._handle_message(data)
+
+                except asyncio.TimeoutError:
+                    logger.warning("UserWebSocket receive timeout")
+                except self._connection_closed as e:
+                    logger.warning("UserWebSocket connection closed: %s", e)
+                    break
+                except ValueError as e:
+                    logger.error("UserWebSocket: failed to parse message: %s", e)
+                except Exception as e:
+                    logger.error("UserWebSocket: error processing message: %s", e)
+        finally:
+            ping_task.cancel()
+
+    async def run(self, auto_reconnect: bool = True) -> None:
+        """Run the user WebSocket with optional auto-reconnect."""
+        self._running = True
+        retry_delay = max(0.25, float(self.reconnect_interval))
+
+        while self._running:
+            if not await self.connect():
+                if auto_reconnect:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(self.max_reconnect_interval, retry_delay * 2.0)
+                    continue
+                else:
+                    break
+            retry_delay = max(0.25, float(self.reconnect_interval))
+
+            try:
+                await self._send_subscribe()
+            except Exception as e:
+                logger.error("UserWebSocket: subscribe failed: %s", e)
+                if auto_reconnect:
+                    await asyncio.sleep(retry_delay)
+                    continue
+                break
+
+            await self._run_loop()
+
+            if self._on_disconnect:
+                self._on_disconnect()
+            if not self._running:
+                break
+            if auto_reconnect:
+                logger.info("UserWebSocket: reconnecting in %.1fs…", retry_delay)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(self.max_reconnect_interval, retry_delay * 2.0)
+            else:
+                break
 
     def stop(self) -> None:
         """Stop the WebSocket client."""

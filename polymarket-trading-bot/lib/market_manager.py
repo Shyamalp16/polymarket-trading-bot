@@ -50,6 +50,7 @@ class MarketInfo:
     token_ids: Dict[str, str]
     prices: Dict[str, float]
     accepting_orders: bool
+    neg_risk: bool = False  # True only for neg-risk events (not BTC/ETH/SOL crypto markets)
 
     @property
     def up_token(self) -> str:
@@ -320,6 +321,7 @@ class MarketManager:
             token_ids=market_data.get("token_ids", {}),
             prices=market_data.get("prices", {}),
             accepting_orders=market_data.get("accepting_orders", False),
+            neg_risk=bool(market_data.get("neg_risk", False)),
         )
 
         if update_state:
