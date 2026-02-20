@@ -65,7 +65,14 @@ class SpreadConfig:
     single_leg_sl_pct: float = 0.15   # SL 15% below entry for directional exposure
     single_leg_tp1_pct: float = 0.15  # TP1 15% above entry — sell 50% of position
     single_leg_tp2_pct: float = 0.25  # TP2 25% above entry — sell remaining 50%
-    single_leg_confirm_secs: float = 10.0  # seconds to wait before declaring single-leg
+    single_leg_confirm_secs: float = 10.0  # min seconds before declaring single-leg
+
+    # Immediate leg completion: when one GTC fills, FAK the other at current ask
+    # to lock the spread instead of waiting for the GTC to fill naturally.
+    # The spread remains profitable as long as (filled_bid + current_ask) < 1.0
+    # and locked profit ≥ min_locked_profit_complete.
+    immediate_complete: bool = True
+    min_locked_profit_complete: float = 0.20  # lower threshold for taker completion
 
     # Overpriced sell-spread
     # When up_ask + down_ask > sell_spread_threshold the market is overpriced:
@@ -635,43 +642,54 @@ class SpreadBot:
             return await self._record_both_fills()
 
         # ── Case 3a: only UP confirmed filled, DOWN confirmed not filled ──────
-        # Require both statuses to be known (not None) before declaring a
-        # single-leg situation — avoids acting on incomplete WS information.
-        # Also wait single_leg_confirm_secs from posting to give the second leg
-        # a fair chance to fill before switching to managed directional mode.
         elapsed = now - legs.posted_at
-        confirm_window = self.config.single_leg_confirm_secs
 
+        # ── Case 3a: UP filled, DOWN not yet filled ───────────────────────────
         if up_filled and not down_filled and down_status is not None:
-            if elapsed < confirm_window:
-                logger.debug(
-                    "Spread: UP filled, DOWN=%s — waiting for second leg (%.1fs / %.1fs)",
-                    down_status, elapsed, confirm_window,
+            if down_dead:
+                # Exchange killed DOWN on its own — switch to directional
+                logger.info(
+                    "Spread: UP filled, DOWN %s by exchange after %.1fs — going directional UP",
+                    down_status, elapsed,
                 )
-                return None  # give the second leg time to fill
-            logger.info(
-                "Spread: only UP filled after %.1fs (DOWN=%s) — cancelling DOWN, managing directional with TP/SL",
-                elapsed, down_status,
-            )
-            await self._cancel_single_order(legs.down_order_id)
-            return await self._record_single_fill(up=True)
+                return await self._record_single_fill(up=True)
 
-        # ── Case 3b: only DOWN confirmed filled, UP confirmed not filled ──────
+            # DOWN is still a live GTC on the book.  Try immediate FAK completion
+            # so we lock the spread instead of waiting indefinitely.
+            completed = await self._complete_other_leg(
+                filled_bid=legs.up_bid,
+                other_order_id=legs.down_order_id,
+                other_token_id=legs.down_token_id,
+                other_is_up=False,
+                elapsed=elapsed,
+            )
+            if completed is not None:
+                return completed
+            # FAK completion skipped or failed — leave GTC open and keep waiting
+            return None
+
+        # ── Case 3b: DOWN filled, UP not yet filled ───────────────────────────
         if down_filled and not up_filled and up_status is not None:
-            if elapsed < confirm_window:
-                logger.debug(
-                    "Spread: DOWN filled, UP=%s — waiting for second leg (%.1fs / %.1fs)",
-                    up_status, elapsed, confirm_window,
+            if up_dead:
+                # Exchange killed UP on its own — switch to directional
+                logger.info(
+                    "Spread: DOWN filled, UP %s by exchange after %.1fs — going directional DOWN",
+                    up_status, elapsed,
                 )
-                return None  # give the second leg time to fill
-            logger.info(
-                "Spread: only DOWN filled after %.1fs (UP=%s) — cancelling UP, managing directional with TP/SL",
-                elapsed, up_status,
-            )
-            await self._cancel_single_order(legs.up_order_id)
-            return await self._record_single_fill(up=False)
+                return await self._record_single_fill(up=False)
 
-        # Both still live, or one status unknown — wait for next poll cycle
+            completed = await self._complete_other_leg(
+                filled_bid=legs.down_bid,
+                other_order_id=legs.up_order_id,
+                other_token_id=legs.up_token_id,
+                other_is_up=True,
+                elapsed=elapsed,
+            )
+            if completed is not None:
+                return completed
+            return None
+
+        # Both still live, one or both statuses unknown — wait for next poll cycle
         return None
 
     async def _poll_order(self, order_id: str) -> Optional[str]:
@@ -693,6 +711,107 @@ class SpreadBot:
             return "live" if order_id in open_ids else "matched"
         except Exception:
             return None
+
+    async def _complete_other_leg(
+        self,
+        filled_bid: float,
+        other_order_id: str,
+        other_token_id: str,
+        other_is_up: bool,
+        elapsed: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Attempt to immediately FAK-buy the unfilled leg at current ask to lock the spread.
+
+        Called when one GTC leg has filled and the other is still live.
+        Strategy:
+          1. Read current ask for the unfilled side from shared state.
+          2. Compute locked profit at (filled_bid + current_ask) × size.
+          3. If profit ≥ min_locked_profit_complete and immediate_complete is on:
+               - Cancel the resting GTC order (avoid double-buy).
+               - FAK-buy at current ask (sweep +0.01 to ensure fill).
+               - Record both fills as a locked spread.
+          4. Otherwise return None — leave the GTC open for natural fill.
+        """
+        if not self.config.immediate_complete:
+            return None
+
+        market = self.state.get_market_data()
+        if not market:
+            return None
+
+        legs = self._legs
+
+        # Read the live ask for the unfilled side
+        if other_is_up:
+            current_ask = market.up_asks[0][0] if market.up_asks else market.up_price
+        else:
+            current_ask = market.down_asks[0][0] if market.down_asks else market.down_price
+
+        locked = (1.0 - filled_bid - current_ask) * legs.size
+        min_ok  = self.config.min_locked_profit_complete
+
+        if locked < min_ok:
+            logger.debug(
+                "Spread complete-other-leg: locked $%.2f < min $%.2f at current ask %.3f — leaving GTC open",
+                locked, min_ok, current_ask,
+            )
+            return None
+
+        side_s = "UP" if other_is_up else "DOWN"
+        logger.info(
+            "Spread: completing %s leg via FAK @ %.3f (locked $%.2f after %.1fs)",
+            side_s, current_ask, locked, elapsed,
+        )
+
+        # Cancel the resting GTC first to avoid double-buy
+        await self._cancel_single_order(other_order_id)
+
+        # FAK-buy at current ask + 1 tick sweep to ensure fill
+        exec_price = round(min(current_ask + 0.01, 0.99), 4)
+        result = await self.bot.place_order(
+            token_id=other_token_id,
+            price=exec_price,
+            size=legs.size,
+            side="BUY",
+            order_type="FAK",
+        )
+
+        if not result.success:
+            logger.error(
+                "==> SPR LEG COMPLETE FAILED: %s FAK at %.3f — %s",
+                side_s, exec_price, result.message,
+            )
+            # GTC was cancelled and FAK failed → go directional as fallback
+            return await self._record_single_fill(up=not other_is_up)
+
+        # Confirm actual fill size
+        actual_filled = legs.size
+        if result.order_id:
+            try:
+                order_data = await self.bot.get_order(result.order_id)
+                raw = (order_data or {}).get("size_matched") or (order_data or {}).get("sizeMatched") or 0
+                actual_filled = float(raw) if float(raw) > 0 else legs.size
+            except Exception:
+                pass
+
+        if actual_filled < 1.0:
+            logger.warning(
+                "Spread complete-other-leg: FAK partial fill %.1f/%.1f sh on %s — going directional",
+                actual_filled, legs.size, side_s,
+            )
+            return await self._record_single_fill(up=not other_is_up)
+
+        # Patch legs with the taker fill price and record the completed spread
+        if other_is_up:
+            legs.up_bid = current_ask   # record actual taker price
+        else:
+            legs.down_bid = current_ask
+
+        logger.info(
+            "==> SPREAD COMPLETE: %s leg FAK'd @ %.3f | locked $%.2f",
+            side_s, current_ask, locked,
+        )
+        return await self._record_both_fills()
 
     async def _record_both_fills(self) -> Dict[str, Any]:
         """Record a complete spread — both legs filled."""

@@ -212,30 +212,46 @@ _PATS: list[tuple] = [
         r"==> SPREAD SINGLE LEG: (\w+) @ ([\d.]+) \| ([\d.]+) sh \| SL ([\d.]+) \| TP1 ([\d.]+) \| TP2 ([\d.]+)"
      ), "SPR", "SIGNAL"),
 
-    # ==> SPREAD TP1 HIT: 0.552 >= 0.552 — closing 50% ...
+    # ==> SPREAD TP1 HIT: 0.552 >= 0.552 — closing 50% (N sh), holding M sh for TP2 T
     (re.compile(
-        r"==> SPREAD TP1 HIT: ([\d.]+) >= ([\d.]+)"
-     ), "SPR", "EXIT"),
+        r"==> SPREAD TP1 HIT: ([\d.]+) >= ([\d.]+) — closing 50% \(([\d.]+) sh\)"
+     ), "SPR", "TRIGGER"),
 
-    # ==> SPREAD TP2 HIT: 0.600 >= 0.600 — closing remaining ...
+    # ==> SPREAD TP1 HIT: 0.552 >= 0.552 — position too small to split, closing fully
     (re.compile(
-        r"==> SPREAD TP2 HIT: ([\d.]+) >= ([\d.]+)"
-     ), "SPR", "EXIT"),
+        r"==> SPREAD TP1 HIT: ([\d.]+) >= ([\d.]+) — position too small"
+     ), "SPR", "TRIGGER"),
+
+    # ==> SPREAD TP2 HIT: 0.600 >= 0.600 — closing remaining N sh
+    (re.compile(
+        r"==> SPREAD TP2 HIT: ([\d.]+) >= ([\d.]+) — closing remaining ([\d.]+)"
+     ), "SPR", "TRIGGER"),
 
     # ==> SPREAD SL HIT: 0.374 < 0.408 — closing N sh
     (re.compile(
-        r"==> SPREAD SL HIT: ([\d.]+) < ([\d.]+)"
-     ), "SPR", "EXIT"),
+        r"==> SPREAD SL HIT: ([\d.]+) < ([\d.]+) — closing ([\d.]+)"
+     ), "SPR", "TRIGGER"),
 
-    # ==> SPREAD CLOSED: SL | 5.00 sh | PnL: -$0.35
+    # ==> SPREAD CLOSED: TP1 | 15.00 sh | PnL: +$1.50
     (re.compile(
-        r"==> SPREAD CLOSED: (\w+) \| ([\d.]+) sh \| PnL: ([+\-\$\d.]+)"
+        r"==> SPREAD CLOSED: ([\w]+) \| ([\d.]+) sh \| PnL: ([+\-\$\d.]+)"
      ), "SPR", "EXIT"),
 
-    # ==> SPR ENTRY FAILED / LEG FAILED
+    # ==> SPREAD EARLY SELL: UP bid=0.540 + DN bid=0.440 ... | early extra=+$X ...
+    (re.compile(
+        r"==> SPREAD EARLY SELL: UP bid=([\d.]+) \+ DN bid=([\d.]+).*early extra=\+\$([\d.]+)"
+     ), "SPR", "SIGNAL"),
+
+    # ==> SPREAD COMPLETE: DOWN leg FAK'd @ 0.480 | locked $0.40
+    (re.compile(
+        r"==> SPREAD COMPLETE: (\w+) leg FAK'd @ ([\d.]+) \| locked \$([\d.]+)"
+     ), "SPR", "LOCKED"),
+
+    # ==> SPR ENTRY FAILED / LEG FAILED / COMPLETE FAILED
     (re.compile(r"==> SPR ENTRY FAILED: (.+)"), "SPR", "ERROR"),
     (re.compile(r"==> SPR LEG FAILED: (.+)"), "SPR", "ERROR"),
     (re.compile(r"==> SPR SELL FAILED: (.+)"), "SPR", "ERROR"),
+    (re.compile(r"==> SPR LEG COMPLETE FAILED: (.+)"), "SPR", "ERROR"),
 
     # ==> SPREAD CLOSE FAILED / PARTIAL
     (re.compile(r"==> SPREAD CLOSE FAILED: (.+)"), "SPR", "ERROR"),
@@ -350,18 +366,20 @@ class TradingEventCapture(logging.Handler):
                 if len(g) == 4:
                     # Bot exit: (reason, shares, price, pnl_raw)
                     reason, shares, price, pnl_raw = g
+                    detail = f"{reason:<6} {shares}sh @ {price}  pnl={pnl_raw}"
                 elif len(g) == 3:
-                    # Spread closed: (reason, shares, pnl_raw) — no fill price
+                    # Spread closed: (reason, shares, pnl_raw) — no separate fill price
                     reason, shares, pnl_raw = g
-                    price = "—"
+                    detail = f"{reason:<10} {shares}sh  pnl={pnl_raw}"
                 else:
-                    reason, pnl_raw = str(g[0]), str(g[-1])
-                    shares, price = "?", "?"
+                    # Fallback — enough groups for reason + pnl at minimum
+                    reason = str(g[0]) if g else "?"
+                    pnl_raw = str(g[-1]) if g else "0"
+                    detail = f"{reason}  pnl={pnl_raw}"
                 try:
                     pnl = float(pnl_raw.replace("$", "").replace("+", ""))
                 except ValueError:
                     pnl = 0.0
-                detail = f"{reason:<6} {shares}sh @ {price}  pnl={pnl_raw}"
                 return TEvent(etype="EXIT", bot=bot, side="--", detail=detail, pnl=pnl)
 
             if etype == "SIGNAL":
@@ -375,13 +393,36 @@ class TradingEventCapture(logging.Handler):
                     detail = f"{s_side:<4} single @ {s_price}  {s_shares}sh  SL={s_sl}"
                     return TEvent(etype="SIGNAL", bot=bot, side=s_side, detail=detail)
                 elif len(g) == 5 and bot == "SPR":
-                    # SPREAD SELL detected: (up_ask, dn_ask, sum, threshold, locked)
+                    # SPREAD SELL signal: (up_ask, dn_ask, sum, threshold, locked)
                     up_a, dn_a, _sum, _thr, locked = g
-                    detail = f"SELL UP@{up_a} + DN@{dn_a}  locked +${locked}"
+                    detail = f"SELL UP ask={up_a} + DN ask={dn_a}  locked +${locked}"
+                    return TEvent(etype="SIGNAL", bot="SPR", side="--", detail=detail)
+                elif len(g) == 3 and bot == "SPR" and "EARLY SELL" in msg:
+                    # SPREAD EARLY SELL: (up_bid, dn_bid, early_extra)
+                    up_b, dn_b, extra = g
+                    detail = f"EARLY SELL UP bid={up_b} + DN bid={dn_b}  extra=+${extra}"
                     return TEvent(etype="SIGNAL", bot="SPR", side="--", detail=detail)
                 else:
                     detail = "  ".join(str(x) for x in g)
                     return TEvent(etype="SIGNAL", bot=bot, side="--", detail=detail)
+
+            if etype == "TRIGGER":
+                # TP1/TP2/SL price trigger — informational only, no PnL (PnL comes from SPREAD CLOSED)
+                if "TP1" in msg and len(g) >= 2:
+                    cur, tgt = g[0], g[1]
+                    half = f"  ({g[2]}sh)" if len(g) == 3 else ""
+                    detail = f"TP1 triggered {cur} >= {tgt}{half}"
+                elif "TP2" in msg and len(g) >= 2:
+                    cur, tgt = g[0], g[1]
+                    rem = f"  rem {g[2]}sh" if len(g) == 3 else ""
+                    detail = f"TP2 triggered {cur} >= {tgt}{rem}"
+                elif "SL" in msg and len(g) >= 2:
+                    cur, tgt = g[0], g[1]
+                    rem = f"  {g[2]}sh" if len(g) == 3 else ""
+                    detail = f"SL triggered {cur} < {tgt}{rem}"
+                else:
+                    detail = "  ".join(str(x) for x in g)
+                return TEvent(etype="EXIT", bot=bot, side="--", detail=detail)
 
             if etype == "MARKET":
                 return TEvent(etype="MARKET", bot="SYS", side="--", detail=f"NEW MARKET  {g[0]}")
@@ -406,6 +447,15 @@ class TradingEventCapture(logging.Handler):
                         pnl = float(locked)
                     except ValueError:
                         pnl = None
+                    return TEvent(etype="LOCKED", bot="SPR", side="--", detail=detail, pnl=pnl)
+                elif len(g) == 3 and "COMPLETE" in msg:
+                    # SPREAD COMPLETE: (leg_side, taker_price, locked)
+                    leg, taker_px, locked = g
+                    try:
+                        pnl = float(locked)
+                    except ValueError:
+                        pnl = None
+                    detail = f"completed {leg} leg @ {taker_px} (taker)  locked +${locked}"
                     return TEvent(etype="LOCKED", bot="SPR", side="--", detail=detail, pnl=pnl)
                 elif len(g) == 3:
                     # SPREAD RELEASED: (up_entry, down_entry, locked)
