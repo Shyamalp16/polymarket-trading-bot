@@ -63,6 +63,9 @@ class SpreadConfig:
 
     # Single-leg risk management
     single_leg_sl_pct: float = 0.15   # SL 15% below entry for directional exposure
+    single_leg_tp1_pct: float = 0.15  # TP1 15% above entry — sell 50% of position
+    single_leg_tp2_pct: float = 0.25  # TP2 25% above entry — sell remaining 50%
+    single_leg_confirm_secs: float = 10.0  # seconds to wait before declaring single-leg
 
     # Overpriced sell-spread
     # When up_ask + down_ask > sell_spread_threshold the market is overpriced:
@@ -109,6 +112,10 @@ class SpreadPosition:
     # If only one leg filled, we manage it as a directional position
     status: str = "spread"   # "spread" | "long_up" | "long_down"
     sl_price: float = 0.0    # only set for single-leg directional
+    tp1_price: float = 0.0   # first TP — sell 50% of position
+    tp2_price: float = 0.0   # second TP — sell remaining 50%
+    tp1_hit: bool = False     # True once TP1 has been partially closed
+    remaining_size: float = 0.0  # tracks how many shares are still open
     entry_time: float = field(default_factory=time.time)
 
     @property
@@ -217,6 +224,10 @@ class SpreadBot:
         if not market:
             return None
 
+        if not market.token_id_up or not market.token_id_down:
+            logger.debug("Spread: skipping — token IDs not yet populated (market data loading)")
+            return None
+
         tte = market.time_to_expiry
         if tte < self.config.min_time_remaining:
             logger.debug("Spread: skipping — only %ds remaining (need %ds)", tte, self.config.min_time_remaining)
@@ -265,11 +276,12 @@ class SpreadBot:
         size: float,
         leg_name: str,
     ):
-        """Post a single spread leg with one retry if the order crosses the book.
+        """Post a single spread leg with up to 2 retries if the order crosses the book.
 
-        A 'crosses book' rejection means the ask moved down to meet our bid
-        between the time we read the orderbook and the time the order landed.
-        We back off by one tick and retry exactly once.
+        A 'crosses book' rejection means the ask fell below our bid between
+        the time we read the orderbook and when the order landed.  On each
+        retry we re-read the live ask from shared state so we always set the
+        bid just below wherever the market actually is right now.
         """
         res = await self.bot.place_order(
             token_id=token_id,
@@ -279,12 +291,28 @@ class SpreadBot:
             order_type="GTC",
             post_only=True,
         )
-        if not res.success and "crosses book" in (res.message or ""):
-            adjusted = round(max(0.01, bid_price - 0.01), 2)
-            logger.info(
-                "SPR: %s crosses book at %.3f — retrying at %.3f",
-                leg_name, bid_price, adjusted,
+
+        for attempt in range(1, 3):  # up to 2 retries on "crosses book"
+            if res.success or "crosses book" not in (res.message or ""):
+                break
+
+            # Re-read the current ask from live market data so we adapt to
+            # wherever the book has moved, rather than just ticking -0.01.
+            market = self.state.get_market_data()
+            if market:
+                if leg_name == "UP":
+                    live_ask = market.up_asks[0][0] if market.up_asks else market.up_price
+                else:
+                    live_ask = market.down_asks[0][0] if market.down_asks else market.down_price
+                adjusted = round(max(0.01, live_ask - self.config.bid_offset - 0.01), 4)
+            else:
+                adjusted = round(max(0.01, bid_price - 0.01 * attempt), 4)
+
+            logger.warning(
+                "==> SPR LEG WARN: %s crosses book (attempt %d) — retrying at %.3f (was %.3f)",
+                leg_name, attempt, adjusted, bid_price,
             )
+            bid_price = adjusted  # update for next iteration log
             res = await self.bot.place_order(
                 token_id=token_id,
                 price=adjusted,
@@ -292,6 +320,12 @@ class SpreadBot:
                 side="BUY",
                 order_type="GTC",
                 post_only=True,
+            )
+
+        if not res.success:
+            logger.error(
+                "==> SPR LEG FAILED: %s rejected at %.3f — %s",
+                leg_name, bid_price, res.message,
             )
         return res
 
@@ -302,7 +336,7 @@ class SpreadBot:
         size: float,
         leg_name: str,
     ):
-        """Post a single SELL spread leg with one retry if the order crosses the book."""
+        """Post a single SELL spread leg with up to 2 retries if the order crosses the book."""
         res = await self.bot.place_order(
             token_id=token_id,
             price=ask_price,
@@ -311,12 +345,16 @@ class SpreadBot:
             order_type="GTC",
             post_only=True,
         )
-        if not res.success and "crosses book" in (res.message or ""):
-            adjusted = round(min(0.99, ask_price + 0.01), 2)
-            logger.info(
-                "SPR SELL: %s crosses book at %.3f — retrying at %.3f",
-                leg_name, ask_price, adjusted,
+
+        for attempt in range(1, 3):
+            if res.success or "crosses book" not in (res.message or ""):
+                break
+            adjusted = round(min(0.99, ask_price + 0.01 * attempt), 4)
+            logger.warning(
+                "==> SPR SELL LEG WARN: %s crosses book (attempt %d) — retrying at %.3f",
+                leg_name, attempt, adjusted,
             )
+            ask_price = adjusted
             res = await self.bot.place_order(
                 token_id=token_id,
                 price=adjusted,
@@ -324,6 +362,12 @@ class SpreadBot:
                 side="SELL",
                 order_type="GTC",
                 post_only=True,
+            )
+
+        if not res.success:
+            logger.error(
+                "==> SPR SELL LEG FAILED: %s rejected at %.3f — %s",
+                leg_name, ask_price, res.message,
             )
         return res
 
@@ -375,7 +419,10 @@ class SpreadBot:
                 return {"success": False, "reason": "both SELL legs rejected"}
 
             if not up_res.success:
-                logger.warning("Spread SELL: UP leg rejected (%s), cancelling DOWN", up_res.message)
+                logger.error(
+                    "==> SPR SELL FAILED: UP leg rejected (%s) — cancelling DOWN",
+                    up_res.message,
+                )
                 if down_res.order_id:
                     try:
                         await self.bot._run_in_thread(self.bot.clob_client.cancel_order, down_res.order_id)
@@ -385,7 +432,10 @@ class SpreadBot:
                 return {"success": False, "reason": f"SELL UP rejected: {up_res.message}"}
 
             if not down_res.success:
-                logger.warning("Spread SELL: DOWN leg rejected (%s), cancelling UP", down_res.message)
+                logger.error(
+                    "==> SPR SELL FAILED: DOWN leg rejected (%s) — cancelling UP",
+                    down_res.message,
+                )
                 if up_res.order_id:
                     try:
                         await self.bot._run_in_thread(self.bot.clob_client.cancel_order, up_res.order_id)
@@ -450,13 +500,18 @@ class SpreadBot:
 
             # Handle partial posting failures
             if not up_res.success and not down_res.success:
-                logger.warning("Spread: both legs rejected — %s / %s",
-                               up_res.message, down_res.message)
+                logger.error(
+                    "==> SPR ENTRY FAILED: both legs rejected — UP: %s | DOWN: %s",
+                    up_res.message, down_res.message,
+                )
                 self._spread_attempted_this_window = False  # allow retry later this window
                 return {"success": False, "reason": "both legs rejected"}
 
             if not up_res.success:
-                logger.warning("Spread: UP leg rejected (%s), cancelling DOWN", up_res.message)
+                logger.error(
+                    "==> SPR ENTRY FAILED: UP leg rejected (%s) — cancelling DOWN",
+                    up_res.message,
+                )
                 if down_res.order_id:
                     try:
                         await self.bot._run_in_thread(self.bot.clob_client.cancel_order, down_res.order_id)
@@ -466,7 +521,10 @@ class SpreadBot:
                 return {"success": False, "reason": f"UP rejected: {up_res.message}"}
 
             if not down_res.success:
-                logger.warning("Spread: DOWN leg rejected (%s), cancelling UP", down_res.message)
+                logger.error(
+                    "==> SPR ENTRY FAILED: DOWN leg rejected (%s) — cancelling UP",
+                    down_res.message,
+                )
                 if up_res.order_id:
                     try:
                         await self.bot._run_in_thread(self.bot.clob_client.cancel_order, up_res.order_id)
@@ -537,29 +595,33 @@ class SpreadBot:
             )
 
         # ── Throttle HTTP polling to fill_poll_interval ───────────────────────
-        # Still run poll if neither WS fill fired (may be all-WS path or mixed).
         need_poll = (now - legs._last_poll >= self.config.fill_poll_interval)
 
         if not ws_up and not ws_down and not need_poll:
             return None  # nothing to do yet
 
-        # Determine status for each leg: WS result takes priority, HTTP as fallback
+        # Determine status for each leg.
+        # IMPORTANT: if WS fires for one leg but not the other, always HTTP-poll
+        # the silent leg immediately before acting.  The WS delivers events in
+        # sequence — the second leg's event may be milliseconds behind.  Acting
+        # on a single WS event without confirming the other leg causes false
+        # single-leg exits and "not enough balance" errors (selling tokens we
+        # don't hold yet).
         if ws_up:
             up_status = "matched"
-        elif need_poll:
+        elif need_poll or ws_down:   # poll UP if DOWN WS fired (race condition guard)
             up_status = await self._poll_order(legs.up_order_id)
         else:
-            up_status = None  # only WS-driven path reached here
+            up_status = None
 
         if ws_down:
             down_status = "matched"
-        elif need_poll:
+        elif need_poll or ws_up:     # poll DOWN if UP WS fired (race condition guard)
             down_status = await self._poll_order(legs.down_order_id)
         else:
             down_status = None
 
-        if need_poll:
-            legs._last_poll = now
+        legs._last_poll = now
 
         up_filled   = up_status   in ("matched", "filled")
         down_filled = down_status in ("matched", "filled")
@@ -572,35 +634,44 @@ class SpreadBot:
         if up_filled and down_filled:
             return await self._record_both_fills()
 
-        # ── Case 3a: only UP filled ───────────────────────────────────────────
-        if up_filled and not down_filled:
-            elapsed_since_up_fill = now - legs.posted_at  # approximate
-            if elapsed_since_up_fill > self.config.single_leg_cancel_window or down_dead:
-                logger.info("Spread: only UP filled — cancelling DOWN and exiting flat")
-                await self._cancel_single_order(legs.down_order_id)
-                return await self._exit_flat(
-                    token_id=legs.up_token_id,
-                    size=legs.size,
-                    entry_price=legs.up_bid,
-                    side="UP",
-                )
-            return None  # still waiting for DOWN to fill
+        # ── Case 3a: only UP confirmed filled, DOWN confirmed not filled ──────
+        # Require both statuses to be known (not None) before declaring a
+        # single-leg situation — avoids acting on incomplete WS information.
+        # Also wait single_leg_confirm_secs from posting to give the second leg
+        # a fair chance to fill before switching to managed directional mode.
+        elapsed = now - legs.posted_at
+        confirm_window = self.config.single_leg_confirm_secs
 
-        # ── Case 3b: only DOWN filled ─────────────────────────────────────────
-        if down_filled and not up_filled:
-            elapsed_since_down_fill = now - legs.posted_at
-            if elapsed_since_down_fill > self.config.single_leg_cancel_window or up_dead:
-                logger.info("Spread: only DOWN filled — cancelling UP and exiting flat")
-                await self._cancel_single_order(legs.up_order_id)
-                return await self._exit_flat(
-                    token_id=legs.down_token_id,
-                    size=legs.size,
-                    entry_price=legs.down_bid,
-                    side="DOWN",
+        if up_filled and not down_filled and down_status is not None:
+            if elapsed < confirm_window:
+                logger.debug(
+                    "Spread: UP filled, DOWN=%s — waiting for second leg (%.1fs / %.1fs)",
+                    down_status, elapsed, confirm_window,
                 )
-            return None  # still waiting for UP to fill
+                return None  # give the second leg time to fill
+            logger.info(
+                "Spread: only UP filled after %.1fs (DOWN=%s) — cancelling DOWN, managing directional with TP/SL",
+                elapsed, down_status,
+            )
+            await self._cancel_single_order(legs.down_order_id)
+            return await self._record_single_fill(up=True)
 
-        # Both still live (or unknown)
+        # ── Case 3b: only DOWN confirmed filled, UP confirmed not filled ──────
+        if down_filled and not up_filled and up_status is not None:
+            if elapsed < confirm_window:
+                logger.debug(
+                    "Spread: DOWN filled, UP=%s — waiting for second leg (%.1fs / %.1fs)",
+                    up_status, elapsed, confirm_window,
+                )
+                return None  # give the second leg time to fill
+            logger.info(
+                "Spread: only DOWN filled after %.1fs (UP=%s) — cancelling UP, managing directional with TP/SL",
+                elapsed, up_status,
+            )
+            await self._cancel_single_order(legs.up_order_id)
+            return await self._record_single_fill(up=False)
+
+        # Both still live, or one status unknown — wait for next poll cycle
         return None
 
     async def _poll_order(self, order_id: str) -> Optional[str]:
@@ -657,14 +728,16 @@ class SpreadBot:
 
         if up:
             entry   = legs.up_bid
-            token   = legs.up_token_id
             sl      = entry * (1 - self.config.single_leg_sl_pct)
+            tp1     = entry * (1 + self.config.single_leg_tp1_pct)
+            tp2     = entry * (1 + self.config.single_leg_tp2_pct)
             status  = "long_up"
             side_s  = "UP"
         else:
             entry   = legs.down_bid
-            token   = legs.down_token_id
             sl      = entry * (1 - self.config.single_leg_sl_pct)
+            tp1     = entry * (1 + self.config.single_leg_tp1_pct)
+            tp2     = entry * (1 + self.config.single_leg_tp2_pct)
             status  = "long_down"
             side_s  = "DOWN"
 
@@ -679,14 +752,17 @@ class SpreadBot:
             down_token_id=legs.down_token_id if not up else "",
             status=status,
             sl_price=sl,
+            tp1_price=tp1,
+            tp2_price=tp2,
+            remaining_size=size,
             entry_time=time.time(),
         )
         self._legs = None
         self._single_legs_today += 1
 
         logger.info(
-            "==> SPREAD SINGLE LEG: %s @ %.3f | %d sh | SL %.3f",
-            side_s, entry, size, sl,
+            "==> SPREAD SINGLE LEG: %s @ %.3f | %.0f sh | SL %.3f | TP1 %.3f | TP2 %.3f",
+            side_s, entry, size, sl, tp1, tp2,
         )
         return {"success": True, "both_filled": False, "side": side_s, "entry": entry}
 
@@ -793,8 +869,10 @@ class SpreadBot:
         pos = self._position
 
         if pos.status == "spread":
-            # Both legs filled — nothing to do until expiry resolves
-            return None
+            # Both legs filled — check for early-exit opportunity:
+            # if current asks sum > sell_spread_threshold we can sell both
+            # holdings now for more than the guaranteed expiry payout.
+            return await self._check_early_sell(pos)
 
         market = self.state.get_market_data()
         if not market:
@@ -806,19 +884,49 @@ class SpreadBot:
         if pos.status == "long_up":
             current_price = market.up_price
             token_id      = pos.up_token_id
-            size          = pos.up_size
             entry         = pos.up_entry
         else:
             current_price = market.down_price
             token_id      = pos.down_token_id
-            size          = pos.down_size
             entry         = pos.down_entry
 
-        # SL check
+        size = pos.remaining_size if pos.remaining_size > 0 else (
+            pos.up_size if pos.status == "long_up" else pos.down_size
+        )
+
+        # ── TP1: sell 50% when first target is reached ────────────────────────
+        if not pos.tp1_hit and pos.tp1_price > 0 and current_price >= pos.tp1_price:
+            half = round(size / 2, 2)
+            if half < 5.0:
+                # Position too small to split — close fully at TP1
+                logger.info(
+                    "==> SPREAD TP1 HIT: %.4f >= %.4f — position too small to split, closing fully",
+                    current_price, pos.tp1_price,
+                )
+                return await self._close_leg(token_id, size, entry, reason="TP1")
+
+            logger.info(
+                "==> SPREAD TP1 HIT: %.4f >= %.4f — closing 50%% (%.1f sh), holding %.1f sh for TP2 %.3f",
+                current_price, pos.tp1_price, half, size - half, pos.tp2_price,
+            )
+            result = await self._close_leg(token_id, half, entry, reason="TP1", clear_position=False)
+            pos.tp1_hit = True
+            pos.remaining_size = round(size - half, 2)
+            return result
+
+        # ── TP2: sell remaining 50% when second target is reached ─────────────
+        if pos.tp1_hit and pos.tp2_price > 0 and current_price >= pos.tp2_price:
+            logger.info(
+                "==> SPREAD TP2 HIT: %.4f >= %.4f — closing remaining %.1f sh",
+                current_price, pos.tp2_price, size,
+            )
+            return await self._close_leg(token_id, size, entry, reason="TP2")
+
+        # SL check — close all remaining shares
         if current_price < pos.sl_price:
             logger.info(
-                "Spread SL hit: %.4f < %.4f — closing single leg",
-                current_price, pos.sl_price,
+                "==> SPREAD SL HIT: %.4f < %.4f — closing %.1f sh",
+                current_price, pos.sl_price, size,
             )
             return await self._close_leg(token_id, size, entry, reason="SL")
 
@@ -829,6 +937,93 @@ class SpreadBot:
 
         return None
 
+    # ── Early sell of a locked spread ────────────────────────────────────────
+
+    async def _check_early_sell(self, pos: SpreadPosition) -> Optional[Dict[str, Any]]:
+        """Sell both legs early when current asks sum > sell_spread_threshold.
+
+        We already hold the UP and DOWN tokens from a filled BUY spread.
+        If the market has moved so that both tokens are trading above their
+        entry prices and asks sum > threshold, selling now captures more
+        profit than waiting for expiry resolution.
+
+        Only valid when status == "spread" (both legs filled and held).
+        """
+        if not pos.is_both_filled:
+            return None
+
+        market = self.state.get_market_data()
+        if not market:
+            return None
+
+        # Never attempt early sell in the final 60s — the market is resolving
+        # and on-chain settlement will handle payouts automatically.
+        if market.time_to_expiry <= 60:
+            return None
+
+        up_bid = market.up_bids[0][0]   if market.up_bids   else market.up_price
+        dn_bid = market.down_bids[0][0] if market.down_bids else market.down_price
+
+        # Revenue from selling both = (up_bid + dn_bid) × size
+        # Cost was the original entry — guaranteed_profit is the locked edge.
+        # Only sell early if we'd collect MORE than the guaranteed expiry payout.
+        sell_revenue = (up_bid + dn_bid) * pos.up_size
+        expiry_payout = max(pos.up_size, pos.down_size)  # one side resolves at $1
+        early_extra = sell_revenue - expiry_payout
+
+        cfg = self.config
+        asks_sum = (market.up_asks[0][0] if market.up_asks else market.up_price) + \
+                   (market.down_asks[0][0] if market.down_asks else market.down_price)
+
+        if asks_sum <= cfg.sell_spread_threshold:
+            return None  # not enough premium to justify early exit
+
+        if early_extra <= 0:
+            return None  # selling now would be worse than holding to expiry
+
+        logger.info(
+            "==> SPREAD EARLY SELL: UP bid=%.3f + DN bid=%.3f (asks sum=%.3f > thr=%.3f) | "
+            "early extra=+$%.2f vs expiry guarantee=+$%.2f",
+            up_bid, dn_bid, asks_sum, cfg.sell_spread_threshold,
+            early_extra, pos.guaranteed_profit,
+        )
+
+        # Sell UP leg
+        up_res = await self.bot.place_order(
+            token_id=pos.up_token_id,
+            price=up_bid,
+            size=pos.up_size,
+            side="SELL",
+            order_type="FAK",
+        )
+        # Sell DOWN leg
+        dn_res = await self.bot.place_order(
+            token_id=pos.down_token_id,
+            price=dn_bid,
+            size=pos.down_size,
+            side="SELL",
+            order_type="FAK",
+        )
+
+        up_filled = pos.up_size if up_res.success else 0.0
+        dn_filled = pos.down_size if dn_res.success else 0.0
+
+        if up_filled > 0 or dn_filled > 0:
+            pnl = (up_bid * up_filled + dn_bid * dn_filled) - pos.cost
+            self._realized_pnl += pnl
+            self._window_pnl   += pnl
+            self._spreads_completed += 1
+            self._position = None
+            self._legs     = None
+            logger.info(
+                "==> SPREAD CLOSED: EARLY_SELL | %.2f sh | PnL: +$%.2f",
+                pos.up_size, pnl,
+            )
+            return {"success": True, "reason": "early_sell", "pnl": pnl}
+
+        logger.warning("Spread early sell: both FAK orders failed — holding to expiry")
+        return None
+
     # ── Position close (FAK with partial-fill tracking) ───────────────────────
 
     async def _close_leg(
@@ -837,8 +1032,13 @@ class SpreadBot:
         size: float,
         entry_price: float,
         reason: str = "manual",
+        clear_position: bool = True,
     ) -> Dict[str, Any]:
-        """Close a single directional leg via FAK with partial-fill tracking."""
+        """Close a single directional leg via FAK with partial-fill tracking.
+
+        Set clear_position=False for partial TP closes (TP1) where the
+        position object should remain alive for TP2/SL monitoring.
+        """
         market = self.state.get_market_data()
         if not market:
             return {"success": False, "reason": "no market data"}
@@ -901,7 +1101,8 @@ class SpreadBot:
                 remaining -= filled
 
                 if remaining < 0.01:
-                    self._position = None
+                    if clear_position:
+                        self._position = None
                     pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
                     logger.info("==> SPREAD CLOSED: %s | %.2f sh | PnL: %s",
                                 reason.upper(), size, pnl_str)
@@ -937,14 +1138,24 @@ class SpreadBot:
             logger.info("Spread: new market — cancelling stale GTX orders")
             await self._cancel_legs()
 
-        if self._position and self._position.status == "spread":
-            logger.info(
-                "==> SPREAD RELEASED: UP %.3f + DOWN %.3f | locked +$%.2f | "
-                "resolves on-chain at market expiry",
-                self._position.up_entry,
-                self._position.down_entry,
-                self._position.guaranteed_profit,
-            )
+        if self._position:
+            if self._position.status == "spread":
+                logger.info(
+                    "==> SPREAD RELEASED: UP %.3f + DOWN %.3f | locked +$%.2f | "
+                    "resolves on-chain at market expiry",
+                    self._position.up_entry,
+                    self._position.down_entry,
+                    self._position.guaranteed_profit,
+                )
+            else:
+                # Single-leg directional — market expired, clear without closing.
+                # The mercy-close at tte<=10s should have handled it already;
+                # this is the safety net in case it didn't.
+                logger.warning(
+                    "Spread: market expired with single-leg %s open — releasing "
+                    "(tokens resolve on-chain, no close attempted)",
+                    self._position.status,
+                )
             self._position = None
 
         self._spread_attempted_this_window = False

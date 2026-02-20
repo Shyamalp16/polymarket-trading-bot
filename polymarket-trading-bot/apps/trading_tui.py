@@ -207,15 +207,35 @@ _PATS: list[tuple] = [
         r"==> SPREAD RELEASED: UP ([\d.]+) \+ DOWN ([\d.]+) \| locked \+\$([\d.]+)"
      ), "SPR", "LOCKED"),
 
-    # ==> SPREAD SINGLE LEG: UP @ 0.480 | 5 sh | SL 0.408
+    # ==> SPREAD SINGLE LEG: UP @ 0.480 | 15 sh | SL 0.408 | TP1 0.552 | TP2 0.600
     (re.compile(
-        r"==> SPREAD SINGLE LEG: (\w+) @ ([\d.]+) \| (\d+) sh \| SL ([\d.]+)"
+        r"==> SPREAD SINGLE LEG: (\w+) @ ([\d.]+) \| ([\d.]+) sh \| SL ([\d.]+) \| TP1 ([\d.]+) \| TP2 ([\d.]+)"
      ), "SPR", "SIGNAL"),
+
+    # ==> SPREAD TP1 HIT: 0.552 >= 0.552 — closing 50% ...
+    (re.compile(
+        r"==> SPREAD TP1 HIT: ([\d.]+) >= ([\d.]+)"
+     ), "SPR", "EXIT"),
+
+    # ==> SPREAD TP2 HIT: 0.600 >= 0.600 — closing remaining ...
+    (re.compile(
+        r"==> SPREAD TP2 HIT: ([\d.]+) >= ([\d.]+)"
+     ), "SPR", "EXIT"),
+
+    # ==> SPREAD SL HIT: 0.374 < 0.408 — closing N sh
+    (re.compile(
+        r"==> SPREAD SL HIT: ([\d.]+) < ([\d.]+)"
+     ), "SPR", "EXIT"),
 
     # ==> SPREAD CLOSED: SL | 5.00 sh | PnL: -$0.35
     (re.compile(
         r"==> SPREAD CLOSED: (\w+) \| ([\d.]+) sh \| PnL: ([+\-\$\d.]+)"
      ), "SPR", "EXIT"),
+
+    # ==> SPR ENTRY FAILED / LEG FAILED
+    (re.compile(r"==> SPR ENTRY FAILED: (.+)"), "SPR", "ERROR"),
+    (re.compile(r"==> SPR LEG FAILED: (.+)"), "SPR", "ERROR"),
+    (re.compile(r"==> SPR SELL FAILED: (.+)"), "SPR", "ERROR"),
 
     # ==> SPREAD CLOSE FAILED / PARTIAL
     (re.compile(r"==> SPREAD CLOSE FAILED: (.+)"), "SPR", "ERROR"),
@@ -963,10 +983,21 @@ class TradingTUI:
                 f"entry {entry:.3f}  {size:.1f}sh  "
                 f"cur {cur_px:.3f}  unreal {_pnl(unreal)}"
             )
+            sl_pct  = (pos.sl_price  - entry) / entry if entry else 0
+            tp1_pct = (pos.tp1_price - entry) / entry if entry and pos.tp1_price else 0
+            tp2_pct = (pos.tp2_price - entry) / entry if entry and pos.tp2_price else 0
+            tp1_tag = _c(C.DIM, f"TP1 {pos.tp1_price:.3f} ({_pct(tp1_pct)}) ✓") if pos.tp1_hit else \
+                      f"TP1 {pos.tp1_price:.3f} ({_pct(tp1_pct)})"
             lines.append(
-                f"{'SL':<12} {pos.sl_price:.3f}  "
-                f"({_pct((pos.sl_price - entry) / entry if entry else 0)} from entry)  "
+                f"{'TP1/TP2/SL':<12} {tp1_tag}  "
+                f"TP2 {pos.tp2_price:.3f} ({_pct(tp2_pct)})  "
+                f"SL {pos.sl_price:.3f} ({_pct(sl_pct)})  "
                 f"({_elapsed(pos.entry_time)} held)"
+            )
+            rem = pos.remaining_size if pos.remaining_size > 0 else size
+            lines.append(
+                f"{'Open':<12} {rem:.1f} sh remaining  "
+                + (_c(C.GRN, "TP1 filled — riding to TP2") if pos.tp1_hit else "waiting for TP1")
             )
             lines.append(f"{'Session':<12} {_pnl(spr._realized_pnl)}  window {_pnl(spr._window_pnl)}")
 

@@ -228,8 +228,6 @@ class SprBotRunner:
         @self.market_manager.on_market_change
         def _on_market_change(market) -> None:  # pyright: ignore[reportUnusedFunction]
             self._seed_neg_risk_cache(market)
-            # Reset spread window state on new market
-            self.spread_bot.on_window_reset()
 
         self._ws_task     = asyncio.create_task(self._expiry_ticker_loop())
         self._spread_task = asyncio.create_task(self._spread_loop())
@@ -278,8 +276,22 @@ class SprBotRunner:
     async def _spread_loop(self):
         """Main SPR loop: check entry, check exits, heartbeat."""
         _last_heartbeat = 0.0
+        _last_token_id_up: str = ""
         while self._running:
             try:
+                # Detect market rotation via token_id change (same logic as coordinator)
+                market_data = self.shared_state.get_market_data()
+                current_token = market_data.token_id_up if market_data else ""
+                if current_token and _last_token_id_up and current_token != _last_token_id_up:
+                    logger.info(
+                        "=== NEW MARKET: %s… → %s… ===",
+                        _last_token_id_up[:8], current_token[:8],
+                    )
+                    await self.spread_bot.on_window_reset()
+                    self.spread_bot.reset_window_pnl()
+                if current_token:
+                    _last_token_id_up = current_token
+
                 # Entry check
                 result = await self.spread_bot.check_spread()
                 if result and result.get("success"):

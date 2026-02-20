@@ -73,6 +73,9 @@ class Order:
 
     def __post_init__(self):
         """Validate and normalize order parameters."""
+        if not self.token_id or not self.token_id.strip():
+            raise ValueError(f"Invalid token_id: {self.token_id!r} — market data not yet loaded")
+
         self.side = self.side.upper()
         if self.side not in ("BUY", "SELL"):
             raise ValueError(f"Invalid side: {self.side}")
